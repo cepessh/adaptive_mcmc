@@ -39,7 +39,7 @@ def compute_metrics(
 
     xs_pred = xs_pred[-trunc_chain_len:]
     
-    #print("avg total variation")
+    # print("avg total variation")
     tracker = average_total_variation(
         key,
         xs_true,

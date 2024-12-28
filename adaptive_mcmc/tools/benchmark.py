@@ -7,8 +7,8 @@ import matplotlib.pyplot as plt
 from torch import Tensor
 import torch
 
-from distributions import Distribution, SamplableDistribution
-import tools.metrics as metrics
+from adaptive_mcmc.distributions.distribution import Distribution, SamplableDistribution
+import adaptive_mcmc.tools.metrics as metrics
 
 
 @dataclass

@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 from torch.distributions import Distribution as torchDist
 
-from distributions import SamplableDistribution, GaussianMixture, Distribution
+from adaptive_mcmc.distributions.distribution import SamplableDistribution, GaussianMixture, Distribution
 
 
 @dataclass
