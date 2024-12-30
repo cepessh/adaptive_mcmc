@@ -1,12 +1,15 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple, Union
+from functools import wraps
+import time
+import tqdm
+from typing import Callable, Optional, Union
 
 import torch
 from torch import Tensor
 from torch.distributions import Distribution as torchDist
 
-from adaptive_mcmc.distributions.distribution import SamplableDistribution, GaussianMixture, Distribution
+from adaptive_mcmc.distributions.distribution import Distribution
 
 
 @dataclass
@@ -17,14 +20,15 @@ class Params:
 
     meta: dict = field(default_factory=dict)
 
-    def copy(self):
+    def copy(self) -> "Params":
         return Params(
             target_dist=self.target_dist,
             starting_point=self.starting_point,
             proposal_dist=self.proposal_dist,
-            meta=self.meta.copy())
+            meta=self.meta.copy()
+        )
 
-    def update_meta(self, new_meta):
+    def update_meta(self, new_meta) -> "Params":
         self.meta.update(new_meta)
         return self.copy()
 
@@ -41,7 +45,7 @@ class Cache:
     grad: Optional[Tensor] = None
 
 
-def update_params(params: Params, cache: Cache):
+def update_params(params: Params, cache: Cache) -> None:
     if cache is None:
         return
 
@@ -74,27 +78,48 @@ class SampleBlock:
     probe_period: Optional[int] = None
     stop_data_hist: list = field(default_factory=list)
 
-    def run(self, cache: Cache = None) -> Cache:
+    def run(self, cache: Cache = None, progress: bool = True) -> Cache:
         update_params(self.iteration.cache.params, cache)
         self.iteration.init()
 
-        for iter_step in range(self.iteration_count):
+        bar = tqdm.notebook.trange(self.iteration_count) if progress else range(self.iteration_count)
+
+        for iter_step in bar:
             self.iteration.run()
 
             if self.stopping_rule and (iter_step + 1) % self.probe_period == 0:
-                stop_data = self.stopping_rule(self.iteration.cache)
-                self.stop_data_hist.append(stop_data.meta)
+                stop_status = self.stopping_rule(self.iteration.cache)
+                self.stop_data_hist.append(stop_status.meta)
 
-                if stop_data.is_stop:
+                if stop_status.is_stop:
                     break
 
         return self.iteration.cache
 
 
+def track_runtime(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        start_time = time.perf_counter()
+        result = func(self, *args, **kwargs)
+        end_time = time.perf_counter()
+        runtime = end_time - start_time
+        print(f"Runtime: {runtime:.2f}s")
+
+        if hasattr(self, 'runtime'):
+            self.runtime = runtime
+
+        return result
+
+    return wrapper
+
+
 @dataclass
 class Pipeline:
     sample_blocks: list[SampleBlock]
+    runtime: float = 0
 
+    @track_runtime
     def run(self, cache: Optional[Cache] = None) -> None:
         print("number of blocks:", len(self.sample_blocks))
         for block_index, block in enumerate(self.sample_blocks):
@@ -109,6 +134,7 @@ class Algorithm(ABC):
     @abstractmethod
     def load_params(self, params: Params):
         pass
+
 
 @dataclass
 class AlgorithmStoppingRule(Algorithm):
