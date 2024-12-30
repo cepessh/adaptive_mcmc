@@ -11,7 +11,7 @@ from adaptive_mcmc.distributions.distribution import (
     SamplableDistribution, GaussianMixture, Distribution
 )
 from adaptive_mcmc.samplers.base_sampler import Cache
-from adaptive_mcmc.tools.metrics import tv_threshold
+from adaptive_mcmc.tools.metrics import compute_tv
 
 
 @dataclass
@@ -28,13 +28,34 @@ class TVStop:
     tail_count_cap: int = 0
 
     def __call__(self, cache: Cache) -> StopStatus:
-        tv_mean, tv_std = tv_threshold(
+        tv_mean, tv_std = compute_tv(
             jnp.array(cache.true_samples), jnp.array(cache.samples[-self.tail_count_cap:]),
             self.density_probe_count, self.projection_count
         )
 
         return StopStatus(
             is_stop=tv_mean < self.threshold,
+            meta={
+                "tv_mean": tv_mean,
+                "tv_std": tv_std,
+            },
+        )
+
+
+@dataclass
+class NoStop:
+    projection_count: int = 25
+    density_probe_count: int = 1000
+    tail_count_cap: int = 0
+
+    def __call__(self, cache: Cache) -> StopStatus:
+        tv_mean, tv_std = compute_tv(
+            jnp.array(cache.true_samples), jnp.array(cache.samples[-self.tail_count_cap:]),
+            self.density_probe_count, self.projection_count
+        )
+
+        return StopStatus(
+            is_stop=False,
             meta={
                 "tv_mean": tv_mean,
                 "tv_std": tv_std,
