@@ -1,13 +1,12 @@
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Callable, Union
 
 import torch
 from torch import Tensor
 from torch.distributions import Distribution as torchDist
 
-from adaptive_mcmc.distributions.distribution import SamplableDistribution, GaussianMixture, Distribution
+from adaptive_mcmc.distributions.distribution import Distribution
 from adaptive_mcmc.samplers import base_sampler
 
 
@@ -29,9 +28,9 @@ class MALAIter(base_sampler.Iteration):
         noise = params.proposal_dist.sample(self.cache.point.shape[:-1])
 
         proposal_point = (
-            self.cache.point + 
-            0.5 * self.cache.grad * params.meta["sigma"] ** 2 + 
-            noise * params.meta["sigma"]
+            self.cache.point
+            + 0.5 * self.cache.grad * params.meta["sigma"] ** 2
+            + noise * params.meta["sigma"]
         ).detach().requires_grad_()
 
         logp_y = params.target_dist.log_prob(proposal_point)
@@ -40,10 +39,9 @@ class MALAIter(base_sampler.Iteration):
         with torch.no_grad():
             log_qyx = params.proposal_dist.log_prob(noise)
             log_qxy = params.proposal_dist.log_prob(
-                (self.cache.point - proposal_point - 
-                0.5 * params.meta["sigma"] ** 2 * grad_y) / params.meta["sigma"]
+                (self.cache.point - proposal_point -
+                 0.5 * params.meta["sigma"] ** 2 * grad_y) / params.meta["sigma"]
             )
-            
             accept_prob = torch.clamp((logp_y + log_qxy - self.cache.logp - log_qyx).exp(), max=1).detach()
             mask = torch.rand_like(accept_prob) < accept_prob
 
@@ -56,7 +54,7 @@ class MALAIter(base_sampler.Iteration):
                     accept_prob[..., None] - params.meta["target_acceptance"]
                 )
             ) ** 0.5
-            
+
         if self.cache.samples is None:
             self.cache.samples = self.cache.point.detach().clone()[None, ...]
         else:
@@ -64,7 +62,7 @@ class MALAIter(base_sampler.Iteration):
         # print(self.cache.params.meta["sigma"])
 
 
-def h(z: Tensor, v: Tensor, sigma: Tensor, prec_factors: list[Tensor], 
+def h(z: Tensor, v: Tensor, sigma: Tensor, prec_factors: list[Tensor],
       target_dist: Union[Distribution, torchDist]) -> Tensor:
     """
     z, v (sample_count, n_dim)
@@ -74,16 +72,16 @@ def h(z: Tensor, v: Tensor, sigma: Tensor, prec_factors: list[Tensor],
 
     logp_v = target_dist.log_prob(v)
     grad_v = torch.autograd.grad(logp_v.sum(), v)[0].detach()
-    
+
     grad_v_img = prec_factors[-1] @ grad_v[..., None]
     for factor in reversed(prec_factors[:-1]):
         grad_v_img = factor @ grad_v_img
 
     grad_v_img = grad_v_img.squeeze()
 
-    return 0.5 * (grad_v[:, None, :] @ 
-                  (z - v - 0.25 * grad_v_img * sigma[..., None] ** 2)[..., None]
-                 ).squeeze()
+    return 0.5 * (
+        grad_v[:, None, :] @ (z - v - 0.25 * grad_v_img * sigma[..., None] ** 2)[..., None]
+    ).squeeze()
 
 
 @dataclass
@@ -111,7 +109,7 @@ class FisherMALAIter(base_sampler.Iteration):
             while len(self.cache.params.meta["sigma_prec"].shape) < 3:
                 self.cache.params.meta["sigma_prec"] = self.cache.params.meta["sigma_prec"][..., None]
 
-    def run(self):        
+    def run(self):
         params = self.cache.params
 
         h_ = partial(h, prec_factors=[params.meta["prec"], params.meta["prec"].permute(0, 2, 1)],
@@ -123,7 +121,7 @@ class FisherMALAIter(base_sampler.Iteration):
         grad_x_img = params.meta["prec"] @ (params.meta["prec"].permute(0, 2, 1) @ grad_x_img)
 
         proposal_point = self.cache.point + (
-            0.5 * grad_x_img * params.meta["sigma_prec"] ** 2 + 
+            0.5 * grad_x_img * params.meta["sigma_prec"] ** 2 +
             params.meta["prec"] @ noise[..., None] * params.meta["sigma_prec"]
         ).squeeze()
         proposal_point = proposal_point.detach().requires_grad_()
@@ -133,7 +131,7 @@ class FisherMALAIter(base_sampler.Iteration):
 
         accept_prob = torch.clamp(
             torch.exp(
-                logp_y + h_(self.cache.point, proposal_point) - 
+                logp_y + h_(self.cache.point, proposal_point) -
                 self.cache.logp - h_(proposal_point, self.cache.point)
             ),
             max=1
@@ -148,10 +146,10 @@ class FisherMALAIter(base_sampler.Iteration):
             gramm_diag = phi_n.permute(0, 2, 1) @ phi_n
 
             if self.step_id == 0:
-                r_1 = 1. / (1 + torch.sqrt(params.meta["damping"] / (params.meta["damping"] + gramm_diag)))
+                r_1 = 1. / (1 + torch.sqrt(params.meta["dampening"] / (params.meta["dampening"] + gramm_diag)))
                 shift = phi_n @ phi_n.permute(0, 2, 1)
-                params.meta["prec"] = 1. / params.meta["damping"] ** 0.5 * (
-                    params.meta["prec"] - shift * r_1 / (params.meta["damping"] + gramm_diag)
+                params.meta["prec"] = 1. / params.meta["dampening"] ** 0.5 * (
+                    params.meta["prec"] - shift * r_1 / (params.meta["dampening"] + gramm_diag)
                 )
             else:
                 r_n = 1. / (1 + torch.sqrt(1 / (1 + gramm_diag)))

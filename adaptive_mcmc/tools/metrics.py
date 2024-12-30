@@ -6,11 +6,27 @@ import ot
 from ex2mcmc.metrics.total_variation import average_total_variation
 from ex2mcmc.metrics.chain import ESS, acl_spectrum, autocovariance
 
+
+def compute_tv(xs_true, xs_pred, density_probe_count, projection_count=25, key=None):
+    if key is None:
+        key = jax.random.PRNGKey(0)
+
+    tracker = average_total_variation(
+        key,
+        xs_true,
+        xs_pred,
+        projection_count=projection_count,
+        density_probe_count=density_probe_count,
+    )
+
+    return tracker.mean(), tracker.std()
+
+
 def compute_metrics(
     xs_true,
     xs_pred,
     name=None,
-    sample_count=1000,
+    density_probe_count=1000,
     scale=1.0,
     trunc_chain_len: int = 0,
     ess_rar=1,
@@ -28,7 +44,6 @@ def compute_metrics(
     metrics = dict()
     key = jax.random.PRNGKey(0)
     projection_count = 25
-    # sample_count = 100
 
     ess = ESS(
         acl_spectrum(
@@ -38,18 +53,14 @@ def compute_metrics(
     metrics["ess"] = ess
 
     xs_pred = xs_pred[-trunc_chain_len:]
-    
-    # print("avg total variation")
-    tracker = average_total_variation(
-        key,
+
+    metrics["tv_mean"], metrics["tv_conf_sigma"] = compute_tv(
         xs_true,
         xs_pred,
         projection_count=projection_count,
-        density_probe_count=sample_count,
+        density_probe_count=density_probe_count,
+        key=key,
     )
-
-    metrics["tv_mean"] = tracker.mean()
-    metrics["tv_conf_sigma"] = tracker.std_of_mean()
 
     metrics["wasserstein"] = 0
 
@@ -59,17 +70,3 @@ def compute_metrics(
         metrics["wasserstein"] += emd / xs_pred.shape[1]
 
     return metrics
-
-
-def tv_threshold(xs_true, xs_pred, density_probe_count, projection_count=25):
-    key = jax.random.PRNGKey(0)
-
-    tracker = average_total_variation(
-        key,
-        xs_true,
-        xs_pred,
-        projection_count=projection_count,
-        density_probe_count=density_probe_count,
-    )
-
-    return tracker.mean(), tracker.std()
