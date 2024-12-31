@@ -1,15 +1,7 @@
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple, Union
 
 import jax.numpy as jnp
-import torch
-from torch import Tensor
-from torch.distributions import Distribution as torchDist
 
-from adaptive_mcmc.distributions.distribution import (
-    SamplableDistribution, GaussianMixture, Distribution
-)
 from adaptive_mcmc.samplers.base_sampler import Cache
 from adaptive_mcmc.tools.metrics import compute_tv
 
@@ -29,8 +21,10 @@ class TVStop:
 
     def __call__(self, cache: Cache) -> StopStatus:
         tv_mean, tv_std = compute_tv(
-            jnp.array(cache.true_samples), jnp.array(cache.samples[-self.tail_count_cap:]),
-            self.density_probe_count, self.projection_count
+            jnp.array(cache.true_samples),
+            jnp.array(cache.samples),
+            density_probe_count=self.density_probe_count,
+            projection_count=self.projection_count
         )
 
         return StopStatus(
@@ -50,8 +44,10 @@ class NoStop:
 
     def __call__(self, cache: Cache) -> StopStatus:
         tv_mean, tv_std = compute_tv(
-            jnp.array(cache.true_samples), jnp.array(cache.samples[-self.tail_count_cap:]),
-            self.density_probe_count, self.projection_count
+            jnp.array(cache.true_samples),
+            jnp.array(cache.samples),
+            density_probe_count=self.density_probe_count,
+            projection_count=self.projection_count
         )
 
         return StopStatus(
