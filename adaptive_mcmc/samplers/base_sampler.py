@@ -1,9 +1,10 @@
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import wraps
 import time
 import tqdm
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -13,30 +14,30 @@ from adaptive_mcmc.distributions.distribution import Distribution
 
 
 @dataclass
-class Params:
+class Params(ABC):
     target_dist: Optional[Union[torchDist, Distribution]] = None
     starting_point: Optional[Tensor] = None
     proposal_dist: Optional[Union[torchDist, Distribution]] = None
-
-    meta: dict = field(default_factory=dict)
+    device: str = "cpu"
 
     def copy(self) -> "Params":
-        return Params(
-            target_dist=self.target_dist,
-            starting_point=self.starting_point,
-            proposal_dist=self.proposal_dist,
-            meta=self.meta.copy()
-        )
+        return deepcopy(self)
 
-    def update_meta(self, new_meta) -> "Params":
-        self.meta.update(new_meta)
-        return self.copy()
+    def update(self, new_params: "Params") -> None:
+        for field_name in new_params.__dict__:
+            new_value = getattr(new_params, field_name)
+            if new_value is not None:
+                setattr(self, field_name, new_value)
+
+    def copy_update(self, new_params: "Params") -> None:
+        updated = self.copy()
+        updated.update(new_params)
+
+        return updated
 
 
 @dataclass
 class Cache:
-    params: Params = field(default_factory=Params)
-
     true_samples: Optional[Tensor] = None
     samples: Optional[Tensor] = None
 
@@ -45,21 +46,22 @@ class Cache:
     grad: Optional[Tensor] = None
 
 
-def update_params(params: Params, cache: Cache) -> None:
+def update_params(params: Params, cache: Cache, new_params: Params) -> None:
     if cache is None:
         return
 
     params.starting_point = cache.point
-    params.update_meta(cache.params.meta)
+    params.update(new_params)
 
 
 @dataclass
 class Iteration(ABC):
-    cache: Cache
+    cache: Cache = field(default_factory=Cache)
+    params: Params = field(default_factory=Params)
 
     def init(self) -> None:
-        self.cache.point = self.cache.params.starting_point.requires_grad_()
-        self.cache.logp = self.cache.params.target_dist.log_prob(self.cache.point)
+        self.cache.point = self.params.starting_point.requires_grad_()
+        self.cache.logp = self.params.target_dist.log_prob(self.cache.point)
         self.cache.grad = torch.autograd.grad(
             self.cache.logp.sum(),
             self.cache.point,
@@ -78,8 +80,8 @@ class SampleBlock:
     probe_period: Optional[int] = None
     stop_data_hist: list = field(default_factory=list)
 
-    def run(self, cache: Cache = None, progress: bool = True) -> Cache:
-        update_params(self.iteration.cache.params, cache)
+    def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None, progress: bool = True) -> Tuple[Cache, Params]:
+        update_params(self.iteration.params, cache, params)
         self.iteration.init()
 
         bar = tqdm.notebook.trange(self.iteration_count) if progress else range(self.iteration_count)
@@ -94,7 +96,7 @@ class SampleBlock:
                 if stop_status.is_stop:
                     break
 
-        return self.iteration.cache
+        return self.iteration.cache, self.iteration.params
 
 
 def track_runtime(func):
@@ -120,20 +122,25 @@ class Pipeline:
     runtime: float = 0
 
     @track_runtime
-    def run(self, cache: Optional[Cache] = None) -> None:
+    def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None) -> None:
         print("number of blocks:", len(self.sample_blocks))
         for block_index, block in enumerate(self.sample_blocks):
             print("processing block:", block_index + 1)
-            cache = block.run(cache)
+            cache, params = block.run(cache, params)
 
 
 @dataclass
 class Algorithm(ABC):
     pipeline: Optional[Pipeline]
+    name: str
 
     @abstractmethod
     def load_params(self, params: Params):
         pass
+
+    def run(self):
+        print("Running", self.name)
+        self.pipeline.run()
 
 
 @dataclass
