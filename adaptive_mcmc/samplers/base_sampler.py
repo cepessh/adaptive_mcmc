@@ -72,33 +72,6 @@ class Iteration(ABC):
         raise NotImplementedError
 
 
-@dataclass
-class SampleBlock:
-    iteration: Iteration
-    iteration_count: int
-    stopping_rule: Optional[Callable] = None
-    probe_period: Optional[int] = None
-    stop_data_hist: list = field(default_factory=list)
-
-    def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None, progress: bool = True) -> Tuple[Cache, Params]:
-        update_params(self.iteration.params, cache, params)
-        self.iteration.init()
-
-        bar = tqdm.notebook.trange(self.iteration_count) if progress else range(self.iteration_count)
-
-        for iter_step in bar:
-            self.iteration.run()
-
-            if self.stopping_rule and (iter_step + 1) % self.probe_period == 0:
-                stop_status = self.stopping_rule(self.iteration.cache)
-                self.stop_data_hist.append(stop_status.meta)
-
-                if stop_status.is_stop:
-                    break
-
-        return self.iteration.cache, self.iteration.params
-
-
 def track_runtime(func):
     @wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -117,9 +90,41 @@ def track_runtime(func):
 
 
 @dataclass
+class SampleBlock:
+    iteration: Iteration
+    iteration_count: int
+    stopping_rule: Optional[Callable] = None
+    probe_period: Optional[int] = None
+    stop_data_hist: list = field(default_factory=list)
+    pure_runtime: float = 0.
+
+    def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None, progress: bool = True) -> Tuple[Cache, Params]:
+        update_params(self.iteration.params, cache, params)
+        self.iteration.init()
+        self.pure_runtime = 0.
+
+        bar = tqdm.notebook.trange(self.iteration_count) if progress else range(self.iteration_count)
+
+        for iter_step in bar:
+            start_time = time.perf_counter()
+            self.iteration.run()
+            self.pure_runtime += time.perf_counter() - start_time
+
+            if self.stopping_rule and (iter_step + 1) % self.probe_period == 0:
+                stop_status = self.stopping_rule(self.iteration.cache)
+                self.stop_data_hist.append(stop_status.meta)
+
+                if stop_status.is_stop:
+                    break
+
+        return self.iteration.cache, self.iteration.params
+
+
+@dataclass
 class Pipeline:
     sample_blocks: list[SampleBlock]
-    runtime: float = 0
+    runtime: float = 0.
+    pure_runtime: float = 0.
 
     @track_runtime
     def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None) -> None:
@@ -127,6 +132,7 @@ class Pipeline:
         for block_index, block in enumerate(self.sample_blocks):
             print("processing block:", block_index + 1)
             cache, params = block.run(cache, params)
+            self.pure_runtime += block.pure_runtime
 
 
 @dataclass
