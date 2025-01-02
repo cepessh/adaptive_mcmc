@@ -150,21 +150,19 @@ class FisherMALAVanilla(base_sampler.AlgorithmStoppingRule):
     stopping_rule: Callable
 
     def load_params(self, params: base_sampler.Params):
-        self.pipeline = base_sampler.Pipeline(
-            [
-                base_sampler.SampleBlock(
-                    iteration=MALAIter(params=params.copy_update(self.sigma_burn_in_params)),
-                    iteration_count=self.sigma_burn_in_iter_count,
-                ),
-                base_sampler.SampleBlock(
-                    iteration=FisherMALAIter(params=params.copy_update(self.prec_burn_in_params)),
-                    iteration_count=self.prec_burn_in_iter_count,
-                ),
-                base_sampler.SampleBlock(
-                    iteration=FisherMALAIter(params=params.copy_update(self.prec_burn_in_params)),
-                    iteration_count=self.sample_iter_count,
-                    stopping_rule=self.stopping_rule,
-                    probe_period=self.probe_period,
-                ),
-            ]
-        )
+        self.pipeline = base_sampler.Pipeline([
+            base_sampler.SampleBlock(
+                iteration=MALAIter(params=params.copy_update(self.sigma_burn_in_params)),
+                iteration_count=self.sigma_burn_in_iter_count,
+            ),
+            base_sampler.SampleBlock(
+                iteration=FisherMALAIter(params=params.copy_update(self.prec_burn_in_params)),
+                iteration_count=self.prec_burn_in_iter_count,
+            ),
+            base_sampler.SampleBlock(
+                iteration=FisherMALAIter(params=params.copy_update(self.prec_burn_in_params)),
+                iteration_count=self.sample_iter_count,
+                stopping_rule=self.stopping_rule,
+                probe_period=self.probe_period,
+            ),
+        ])
