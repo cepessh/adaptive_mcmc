@@ -65,11 +65,33 @@ class Iteration(ABC):
         self.cache.grad = torch.autograd.grad(
             self.cache.logp.sum(),
             self.cache.point,
-        )[0].detach()
+            retain_graph=True,
+        )[0].detach().requires_grad_()
 
     @abstractmethod
     def run(self) -> Cache:
         raise NotImplementedError
+
+    def collect_sample(self, sample: Tensor):
+        if self.cache.samples is None:
+            self.cache.samples = sample[None, ...]
+        else:
+            self.cache.samples = torch.cat([self.cache.samples, sample[None, ...]], 0)
+
+
+@dataclass
+class MHIteration(Iteration):
+    def MHStep(self, point_new, logp_new, grad_new, accept_prob) -> None:
+        with torch.no_grad():
+            mask = torch.rand_like(accept_prob, device=self.params.device) < accept_prob
+
+            self.cache.point[mask] = point_new[mask]
+            self.cache.logp[mask] = logp_new[mask]
+            self.cache.grad[mask] = grad_new[mask]
+
+        self.cache.point = self.cache.point.detach().requires_grad_(self.cache.point.requires_grad)
+        self.cache.logp = self.cache.logp.detach().requires_grad_(self.cache.logp.requires_grad)
+        self.cache.grad = self.cache.grad.detach().requires_grad_(self.cache.grad.requires_grad)
 
 
 def track_runtime(func):
