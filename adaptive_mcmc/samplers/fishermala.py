@@ -51,6 +51,7 @@ class FisherMALAIter(base_sampler.Iteration):
         super().init()
         self.step_id = 0
 
+        # TODO: move adaptive parameters like prec from params to cache
         if self.params.prec is None:
             self.params.prec = torch.eye(self.cache.point.shape[-1]).repeat(*self.cache.point.shape[:-1], 1, 1)
 
