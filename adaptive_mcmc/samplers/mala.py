@@ -15,7 +15,7 @@ class MALAParams(base_sampler.Params):
 
 
 @dataclass
-class MALAIter(base_sampler.Iteration):
+class MALAIter(base_sampler.MHIteration):
     params: MALAParams = field(default_factory=MALAParams)
 
     def init(self):
@@ -49,11 +49,6 @@ class MALAIter(base_sampler.Iteration):
                  - 0.5 * params.sigma ** 2 * grad_y) / params.sigma
             )
             accept_prob = torch.clamp((logp_y + log_qxy - self.cache.logp - log_qyx).exp(), max=1).detach()
-            mask = torch.rand_like(accept_prob) < accept_prob
-
-            self.cache.point[mask] = proposal_point[mask]
-            self.cache.logp[mask] = logp_y[mask]
-            self.cache.grad[mask] = grad_y[mask]
 
             params.sigma = params.sigma * (
                 1 + params.sigma_lr * (
@@ -61,10 +56,13 @@ class MALAIter(base_sampler.Iteration):
                 )
             ) ** 0.5
 
-        if self.cache.samples is None:
-            self.cache.samples = self.cache.point.detach().clone()[None, ...]
-        else:
-            self.cache.samples = torch.cat([self.cache.samples, self.cache.point.detach().clone()[None, ...]], 0)
+        self.MHStep(
+            point_new=proposal_point,
+            logp_new=logp_y,
+            grad_new=grad_y,
+            accept_prob=accept_prob,
+        )
+        self.collect_sample(self.cache.point.detach().clone())
 
 
 @dataclass
