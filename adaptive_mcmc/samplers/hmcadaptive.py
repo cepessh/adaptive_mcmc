@@ -48,8 +48,35 @@ class HMCAdaptiveParams(HMCParams):
 
 
 @dataclass
+class CholeskyParametrization:
+    def __init__(self, batch_size, dimension, device, scale=1e-2):
+        self.batch_size = batch_size
+        self.dimension = dimension
+        self.device = device
+        self.params = scale * torch.randn(batch_size * dimension * (dimension + 1) // 2, device=device)
+        self.params = self.params.requires_grad_()
+
+    def make_prec(self) -> Tensor:
+        self.prec = torch.zeros(self.batch_size, self.dimension, self.dimension, device=self.device)
+
+        tril_ind = torch.tril_indices(row=self.dimension, col=self.dimension)
+        for i in range(self.batch_size):
+            start_idx = i * self.dimension * (self.dimension + 1) // 2
+            end_idx = start_idx + self.dimension * (self.dimension + 1) // 2
+            raw_params = self.params[start_idx:end_idx]
+
+            L = torch.zeros(self.dimension, self.dimension, device=self.device)
+            L[tril_ind[0], tril_ind[1]] = raw_params
+            diag_ind = torch.arange(self.dimension)
+            L[diag_ind, diag_ind] = torch.exp(L[diag_ind, diag_ind])
+            self.prec[i] = L
+
+        return self.prec
+
+
+@dataclass
 class AdaptiveCache(base_sampler.Cache):
-    prec: Optional[Tensor] = None
+    prec_params: Optional[CholeskyParametrization] = None
     optimizer: Optional[torch.optim.Optimizer] = None
 
 
@@ -63,33 +90,28 @@ class HMCAdaptiveIter(HMCIter):
         super().init()
         self.step_id = 0
 
-        if self.cache.prec is None:
-            self.cache.prec = torch.eye(
-                self.cache.point.shape[-1],
+        if self.cache.prec_params is None:
+            self.cache.prec_params = CholeskyParametrization(
+                batch_size=self.cache.point.shape[0],
+                dimension=self.cache.point.shape[-1],
                 device=self.params.device,
-            ).repeat(*self.cache.point.shape[:-1], 1, 1).detach().requires_grad_()
-
-            # pos_def = torch.randn(self.cache.point.shape[0], self.cache.point.shape[-1], self.cache.point.shape[-1],
-            #                       device=self.params.device)
-            # pos_def = torch.bmm(pos_def, pos_def.permute(0, 2, 1))
-
-            # self.cache.prec = torch.linalg.cholesky(pos_def).detach().requires_grad_()
+            )
 
         if isinstance(self.params.entropy_weight, float):
             self.params.entropy_weight = Tensor([self.params.entropy_weight]).repeat(*self.cache.point.shape[:-1], 1)
         else:
-            while len(self.params.entropy_weight.shape) < 3:
+            while len(self.params.entropy_weight.shape) < 2:
                 self.params.entropy_weight = self.params.entropy_weight[..., None]
 
         if isinstance(self.params.penalty_weight, float):
             self.params.penalty_weight = Tensor([self.params.penalty_weight]).repeat(*self.cache.point.shape[:-1], 1)
         else:
-            while len(self.params.penalty_weight.shape) < 3:
+            while len(self.params.penalty_weight.shape) < 2:
                 self.params.penalty_weight = self.params.penalty_weight[..., None]
 
         if self.cache.optimizer is None:
             self.cache.optimizer = self.params.optimizer_cls(
-                [self.cache.prec],
+                [self.cache.prec_params.params],
                 lr=self.params.learning_rate
             )
 
@@ -122,21 +144,28 @@ class HMCAdaptiveIter(HMCIter):
         self.geometric_cdf = geometric_cdf
 
     def run(self):
-        noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
-        p = torch.linalg.solve(self.cache.prec, noise)
-
+        self.cache.prec = self.cache.prec_params.make_prec()
         Minv = torch.bmm(self.cache.prec, self.cache.prec.permute(0, 2, 1))
+        trajectory = None
 
-        trajectory = self.lf_intergrator.run(
-            q=self.cache.point,
-            p=p,
-            gradq=self.cache.grad,
-            Minv=Minv,
-            target_dist=self.params.target_dist,
-            step_count=self.params.lf_step_count,
-            step_size=self.params.lf_step_size,
-            stop_grad=self.params.stop_grad,
-        )
+        while trajectory is None:
+            noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
+            p = torch.linalg.solve(self.cache.prec, noise)
+
+            while torch.isnan(p).any().item():
+                noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
+                p = torch.linalg.solve(self.cache.prec, noise)
+
+            trajectory = self.lf_intergrator.run(
+                q=self.cache.point,
+                p=p,
+                gradq=self.cache.grad,
+                Minv=Minv,
+                target_dist=self.params.target_dist,
+                step_count=self.params.lf_step_count,
+                step_size=self.params.lf_step_size,
+                stop_grad=self.params.stop_grad,
+            )
 
         self.trajectory = trajectory
 
@@ -236,7 +265,7 @@ class HMCAdaptiveIter(HMCIter):
 
             self.params.penalty_weight = torch.clamp(
                 self.params.penalty_weight * (
-                    1 + self.params.penalty_weight_adaptive_rate * penalty[..., None]
+                    1 + self.params.penalty_weight_adaptive_rate * penalty
                 ),
                 min=self.params.penalty_weight_min,
                 max=self.params.penalty_weight_max,

@@ -12,7 +12,7 @@ from adaptive_mcmc.samplers import base_sampler
 @dataclass
 class HMCParams(base_sampler.Params):
     prec: Optional[Tensor] = None
-    lf_step_size: float = 1e-3
+    lf_step_size: float = 1e-2
     lf_step_count: int = 5
     target_acceptance: float = 0.65
 
@@ -24,7 +24,6 @@ class Leapfrog():
              step_size: float = 1e-3, stop_grad: bool = True) -> dict:
 
         p_half = p_prev + 0.5 * step_size * gradq_prev
-
         q_next = q_prev + step_size * torch.bmm(Minv, p_half.unsqueeze(-1)).squeeze(-1)
 
         if stop_grad:
@@ -47,7 +46,7 @@ class Leapfrog():
     def run(self, q: Tensor, p: Tensor, gradq: Tensor, Minv: Tensor,
             target_dist: Union[Distribution, torchDist],
             step_count: int = 5, step_size: float = 1e-3,
-            stop_grad: bool = True, keep_trajectory=False) -> List[dict]:
+            stop_grad: bool = True, keep_trajectory=False) -> Optional[List[dict]]:
 
         ret = {"q": q, "p": p, "gradq": gradq}
         trajectory = [ret]
@@ -58,6 +57,9 @@ class Leapfrog():
                 Minv=Minv, target_dist=target_dist, step_size=step_size,
                 stop_grad=stop_grad,
             )
+            if any(torch.isnan(tensor).any().item() for tensor in [ret["q"], ret["p"], ret["gradq"]]):
+                return None
+
             trajectory.append(ret)
 
         return trajectory
@@ -77,21 +79,27 @@ class HMCIter(base_sampler.MHIteration):
 
     def run(self):
         params = self.params
-
-        noise = params.proposal_dist.sample(self.cache.point.shape[:-1])
-        p = torch.linalg.solve(self.params.prec, noise)
-
         Minv = torch.bmm(self.params.prec, self.params.prec.permute(0, 2, 1))
 
-        trajectory = self.lf_intergrator.run(
-            q=self.cache.point,
-            p=p,
-            gradq=self.cache.grad,
-            Minv=Minv,
-            target_dist=params.target_dist,
-            step_count=params.lf_step_count,
-            step_size=params.lf_step_size,
-        )
+        trajectory = None
+
+        while trajectory is None:
+            noise = params.proposal_dist.sample(self.cache.point.shape[:-1])
+            p = torch.linalg.solve(self.params.prec, noise)
+
+            while torch.isnan(p).any().item():
+                noise = params.proposal_dist.sample(self.cache.point.shape[:-1])
+                p = torch.linalg.solve(self.params.prec, noise)
+
+            trajectory = self.lf_intergrator.run(
+                q=self.cache.point,
+                p=p,
+                gradq=self.cache.grad,
+                Minv=Minv,
+                target_dist=params.target_dist,
+                step_count=params.lf_step_count,
+                step_size=params.lf_step_size,
+            )
 
         point_new = trajectory[-1]["q"]
         logp_new = params.target_dist.log_prob(point_new)
