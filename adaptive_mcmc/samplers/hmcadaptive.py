@@ -132,7 +132,7 @@ class HMCAdaptiveIter(HMCIter):
             )[1]
             return (
                 -self.params.lf_step_size ** 2 * (self.params.lf_step_count ** 2 - 1) / 6
-                * torch.bmm(self.cache.prec.permute(0, 2, 1), z.unsqueeze(-1)).squeeze(-1)
+                * torch.einsum("...ij,...i->...j", self.cache.prec, z)
             ).requires_grad_()
 
         self.DL = DL
@@ -145,7 +145,8 @@ class HMCAdaptiveIter(HMCIter):
 
     def run(self):
         self.cache.prec = self.cache.prec_params.make_prec()
-        Minv = torch.bmm(self.cache.prec, self.cache.prec.permute(0, 2, 1))
+        Minv = torch.einsum("...ij,...kj->...ik", self.cache.prec, self.cache.prec)
+
         trajectory = None
 
         while trajectory is None:
@@ -174,17 +175,11 @@ class HMCAdaptiveIter(HMCIter):
         grad_new = trajectory[-1]["gradq"]
         p_new = trajectory[-1]["p"]
 
-        # ??\Xi_L
-        # grad_trajectory_sum = torch.zeros_like(trajectory[0]["gradq"])
-        # for i in range(1, self.params.lf_step_count):
-        #     grad_trajectory_sum += (self.params.lf_step_count - i) * trajectory[i]["gradq"]
-
-        # ??\Delta(q_0, v)
         energy_error = (
             logp_new - self.cache.logp
             - 0.5 * (
-                torch.bmm(torch.bmm(p_new.unsqueeze(1), Minv), p_new.unsqueeze(-1)).squeeze()
-                - torch.bmm(torch.bmm(p.unsqueeze(1), Minv), p.unsqueeze(-1)).squeeze()
+                torch.einsum("...i,...ij,...j->...", p_new, Minv, p_new)
+                - torch.einsum("...i,...ij,...j->...", p, Minv, p)
             )
         )
 
@@ -228,7 +223,7 @@ class HMCAdaptiveIter(HMCIter):
             trace += sign / (1 - self.geometric_cdf(i)) * cur_vec
             sign *= -1
 
-        return torch.bmm(trace.unsqueeze(1), self.DL(mid_traj, eps).unsqueeze(-1)).squeeze(), cur_vec
+        return torch.einsum("...i,...i->...", trace, self.DL(mid_traj, eps)), cur_vec
 
     def _adapt(self, energy_error: Tensor, accept_prob: Tensor, trajectory: Tensor, grad_new: Tensor):
         mid_traj = trajectory[1 + self.params.lf_step_count // 2]["q"]
@@ -237,7 +232,8 @@ class HMCAdaptiveIter(HMCIter):
         ltheta, eta = self._normalized_trace_estimator(mid_traj)
 
         b_n = eta / torch.norm(eta, p=2, dim=-1, keepdim=True)
-        mu_n = torch.bmm(b_n.unsqueeze(1), self.DL(mid_traj, b_n).unsqueeze(-1)).squeeze(-1)
+        mu_n = torch.einsum("...i,...i->...", b_n, self.DL(mid_traj, b_n)).unsqueeze(-1)
+
         penalty = self.params.penalty_func(torch.abs(mu_n))
 
         loss = (
