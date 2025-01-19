@@ -29,11 +29,11 @@ def default_penalty_fn(x: Tensor) -> Tensor:
 class HMCAdaptiveParams(HMCParams):
     truncation_level_prob: float = 0.5
     min_truncation_level: int = 2
-    spectral_normalization_decay: float = 0.9
+    spectral_normalization_decay: float = 0.99
     learning_rate: float = 5e-3
 
     entropy_weight: float = 1.
-    entropy_weight_min: float = 1e-2
+    entropy_weight_min: float = 1e-3
     entropy_weight_max: float = 1e2
     entropy_weight_adaptive_rate: float = 1e-2
 
@@ -102,7 +102,12 @@ class HMCAdaptiveIter(HMCIter):
             )[0]
 
         def DL(x: Tensor, v: Tensor) -> Tensor:
-            z = torch.autograd.functional.jvp(grad_logp, x, v, create_graph=True)[1]
+            z = torch.autograd.functional.jvp(
+                grad_logp,
+                x,
+                torch.bmm(self.cache.prec, v.unsqueeze(-1)).squeeze(-1),
+                create_graph=True,
+            )[1]
             return (
                 -self.params.lf_step_size ** 2 * (self.params.lf_step_count ** 2 - 1) / 6
                 * torch.bmm(self.cache.prec.permute(0, 2, 1), z.unsqueeze(-1)).squeeze(-1)
@@ -203,8 +208,8 @@ class HMCAdaptiveIter(HMCIter):
         ltheta, eta = self._normalized_trace_estimator(mid_traj)
 
         b_n = eta / torch.norm(eta, p=2, dim=-1, keepdim=True)
-        mu_n = torch.bmm(b_n.unsqueeze(1), self.DL(mid_traj, b_n).unsqueeze(-1)).squeeze()
-        penalty = self.params.penalty_func(mu_n)
+        mu_n = torch.bmm(b_n.unsqueeze(1), self.DL(mid_traj, b_n).unsqueeze(-1)).squeeze(-1)
+        penalty = self.params.penalty_func(torch.abs(mu_n))
 
         loss = (
             -torch.clamp(-energy_error, max=0)
