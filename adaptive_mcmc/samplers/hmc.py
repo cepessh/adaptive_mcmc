@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Union
 
@@ -12,22 +13,29 @@ from adaptive_mcmc.samplers import base_sampler
 @dataclass
 class HMCParams(base_sampler.Params):
     prec: Optional[Tensor] = None
+    Minv: Optional[Tensor] = None
     lf_step_size: float = 1e-2
     lf_step_count: int = 5
     target_acceptance: float = 0.65
+    stop_grad: bool = False
+    no_grad: bool = True
 
 
-@dataclass
 class Leapfrog():
     def step(self, q_prev: Tensor, p_prev: Tensor, gradq_prev: Tensor,
              Minv: Tensor, target_dist: Union[Distribution, torchDist],
-             step_size: float = 1e-3, stop_grad: bool = True) -> dict:
+             step_size: float = 1e-3, stop_grad: bool = True, no_grad: bool = False) -> dict:
 
-        p_half = p_prev + 0.5 * step_size * gradq_prev
-        q_next = q_prev + step_size * torch.bmm(Minv, p_half.unsqueeze(-1)).squeeze(-1)
+        context = torch.no_grad() if no_grad else nullcontext()
+
+        with context:
+            p_half = p_prev + 0.5 * step_size * gradq_prev
+            q_next = q_prev + step_size * torch.bmm(Minv, p_half.unsqueeze(-1)).squeeze(-1)
 
         if stop_grad:
             q_next = q_next.detach().requires_grad_()
+        else:
+            q_next = q_next.requires_grad_()
 
         logq_next = target_dist.log_prob(q_next)
         gradq_next = torch.autograd.grad(logq_next.sum(), q_next, retain_graph=True)[0]
@@ -35,7 +43,8 @@ class Leapfrog():
         if stop_grad:
             gradq_next = gradq_next.detach().requires_grad_()
 
-        p_next = p_half + 0.5 * step_size * gradq_next
+        with context:
+            p_next = p_half + 0.5 * step_size * gradq_next
 
         return {
             "q": q_next,
@@ -46,7 +55,7 @@ class Leapfrog():
     def run(self, q: Tensor, p: Tensor, gradq: Tensor, Minv: Tensor,
             target_dist: Union[Distribution, torchDist],
             step_count: int = 5, step_size: float = 1e-3,
-            stop_grad: bool = True, keep_trajectory=False) -> Optional[List[dict]]:
+            stop_grad: bool = True, no_grad: bool = False, keep_trajectory=False) -> Optional[List[dict]]:
 
         ret = {"q": q, "p": p, "gradq": gradq}
         trajectory = [ret]
@@ -55,7 +64,7 @@ class Leapfrog():
             ret = self.step(
                 q_prev=ret["q"], p_prev=ret["p"], gradq_prev=ret["gradq"],
                 Minv=Minv, target_dist=target_dist, step_size=step_size,
-                stop_grad=stop_grad,
+                stop_grad=stop_grad, no_grad=no_grad,
             )
             if any(torch.isnan(tensor).any().item() for tensor in [ret["q"], ret["p"], ret["gradq"]]):
                 return None
@@ -74,56 +83,73 @@ class HMCIter(base_sampler.MHIteration):
         super().init()
         self.step_id = 0
 
-        if self.params.prec is None:
+        if hasattr(self.cache, "prec"):
+            self.params.prec = self.cache.prec
+            self.params.Minv = torch.einsum("...ij,...kj->...ik", self.cache.prec, self.cache.prec)
+        elif self.params.prec is None:
             self.params.prec = torch.eye(self.cache.point.shape[-1], device=self.params.device).repeat(*self.cache.point.shape[:-1], 1, 1)
+            self.params.Minv = self.params.prec
 
-    def run(self):
-        params = self.params
-        Minv = torch.bmm(self.params.prec, self.params.prec.permute(0, 2, 1))
-
+    def _run_iter(self, prec: Tensor, Minv: Tensor) -> dict:
         trajectory = None
-
         while trajectory is None:
-            noise = params.proposal_dist.sample(self.cache.point.shape[:-1])
-            p = torch.linalg.solve(self.params.prec, noise)
-
-            while torch.isnan(p).any().item():
-                noise = params.proposal_dist.sample(self.cache.point.shape[:-1])
-                p = torch.linalg.solve(self.params.prec, noise)
+            noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
+            p = torch.linalg.solve_triangular(
+                torch.einsum("...ij->...ji", prec),
+                noise.unsqueeze(-1),
+                upper=True,
+            ).squeeze(-1)
 
             trajectory = self.lf_intergrator.run(
                 q=self.cache.point,
                 p=p,
                 gradq=self.cache.grad,
                 Minv=Minv,
-                target_dist=params.target_dist,
-                step_count=params.lf_step_count,
-                step_size=params.lf_step_size,
+                target_dist=self.params.target_dist,
+                step_count=self.params.lf_step_count,
+                step_size=self.params.lf_step_size,
+                stop_grad=self.params.stop_grad,
+                no_grad=self.params.no_grad,
             )
 
-        point_new = trajectory[-1]["q"]
-        logp_new = params.target_dist.log_prob(point_new)
-        grad_new = trajectory[-1]["gradq"]
-        p_new = trajectory[-1]["p"]
+        context = torch.no_grad() if self.params.no_grad else nullcontext()
 
-        energy_error = (
-            logp_new - self.cache.logp
-            - 0.5 * (
-                torch.bmm(torch.bmm(p_new.unsqueeze(1), Minv), p_new.unsqueeze(-1)).squeeze()
-                - torch.bmm(torch.bmm(p.unsqueeze(1), Minv), p.unsqueeze(-1)).squeeze()
+        with context:
+            self.trajectory = trajectory
+
+            point_new = trajectory[-1]["q"]
+            logp_new = self.params.target_dist.log_prob(point_new)
+            grad_new = trajectory[-1]["gradq"]
+            p_new = trajectory[-1]["p"]
+
+            energy_error = (
+                logp_new - self.cache.logp.detach()
+                - 0.5 * (
+                    torch.einsum("...i,...ij,...j->...", p_new, Minv, p_new)
+                    - torch.einsum("...i,...ij,...j->...", p, Minv, p)
+                )
             )
-        )
 
-        accept_prob = torch.clamp(torch.exp(energy_error), max=1)
+            accept_prob = torch.clamp(torch.exp(energy_error), max=1)
 
-        self.MHStep(
-            point_new=point_new,
-            logp_new=logp_new,
-            grad_new=grad_new,
-            accept_prob=accept_prob,
-        )
-        self.collect_sample(self.cache.point.detach().clone())
-        self.step_id += 1
+            self.MHStep(
+                point_new=point_new,
+                logp_new=logp_new,
+                grad_new=grad_new,
+                accept_prob=accept_prob,
+            )
+            self.collect_sample(self.cache.point.detach().clone())
+            self.step_id += 1
+
+        return {
+            "energy_error": energy_error,
+            "accept_prob": accept_prob,
+            "trajectory": trajectory,
+            "grad_new": grad_new,
+        }
+
+    def run(self):
+        self._run_iter(prec=self.params.prec, Minv=self.params.Minv)
 
 
 @dataclass

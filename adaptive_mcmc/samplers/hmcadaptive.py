@@ -46,6 +46,9 @@ class HMCAdaptiveParams(HMCParams):
     stop_grad: bool = False
     optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam
 
+    def __post__init__(self):
+        self.no_grad = False
+
 
 @dataclass
 class CholeskyParametrization:
@@ -142,68 +145,23 @@ class HMCAdaptiveIter(HMCIter):
                 return 0
             return 1 - (1 - self.params.min_truncation_level) ** (k - self.params.min_truncation_level + 1)
         self.geometric_cdf = geometric_cdf
+        self.geom_dist = torch.distributions.Geometric(self.params.truncation_level_prob)
 
     def run(self):
         self.cache.prec = self.cache.prec_params.make_prec()
         Minv = torch.einsum("...ij,...kj->...ik", self.cache.prec, self.cache.prec)
 
-        trajectory = None
-
-        while trajectory is None:
-            noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
-            p = torch.linalg.solve_triangular(
-                torch.einsum("...ij->...ji", self.cache.prec),
-                noise.unsqueeze(-1),
-                upper=True,
-            ).squeeze(-1)
-
-            trajectory = self.lf_intergrator.run(
-                q=self.cache.point,
-                p=p,
-                gradq=self.cache.grad,
-                Minv=Minv,
-                target_dist=self.params.target_dist,
-                step_count=self.params.lf_step_count,
-                step_size=self.params.lf_step_size,
-                stop_grad=self.params.stop_grad,
-            )
-
-        self.trajectory = trajectory
-
-        point_new = trajectory[-1]["q"]
-        logp_new = self.params.target_dist.log_prob(point_new)
-        grad_new = trajectory[-1]["gradq"]
-        p_new = trajectory[-1]["p"]
-
-        energy_error = (
-            logp_new - self.cache.logp
-            - 0.5 * (
-                torch.einsum("...i,...ij,...j->...", p_new, Minv, p_new)
-                - torch.einsum("...i,...ij,...j->...", p, Minv, p)
-            )
-        )
-
-        accept_prob = torch.clamp(torch.exp(energy_error), max=1)
-
+        ret = self._run_iter(prec=self.cache.prec, Minv=Minv)
         self._adapt(
-            energy_error=energy_error,
-            accept_prob=accept_prob,
-            trajectory=trajectory,
-            grad_new=grad_new,
+            energy_error=ret["energy_error"],
+            accept_prob=ret["accept_prob"],
+            trajectory=ret["trajectory"],
+            grad_new=ret["grad_new"],
         )
-
-        self.MHStep(
-            point_new=point_new,
-            logp_new=logp_new,
-            grad_new=grad_new,
-            accept_prob=accept_prob,
-        )
-        self.collect_sample(self.cache.point.detach().clone())
-        self.step_id += 1
 
     def _normalized_trace_estimator(self, mid_traj: Tensor) -> Tuple[Tensor, Tensor]:
         truncation_level = self.params.min_truncation_level
-        truncation_level += int(torch.distributions.Geometric(self.params.truncation_level_prob).sample((1,)).item())
+        truncation_level += int(self.geom_dist.sample((1,)).item())
 
         eps = torch.randint_like(mid_traj, low=0, high=2, device=self.params.device) * 2 - 1
         cur_vec = eps
@@ -219,6 +177,7 @@ class HMCAdaptiveIter(HMCIter):
                 * torch.norm(cur_vec, dim=-1, p=2) / torch.norm(cur_res, dim=-1, p=2),
                 max=1,
             ).unsqueeze(-1)
+
             cur_vec = spectral_normalization * cur_res
             trace += sign / (1 - self.geometric_cdf(i)) * cur_vec
             sign *= -1
