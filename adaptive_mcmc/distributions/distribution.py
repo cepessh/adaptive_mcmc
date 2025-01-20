@@ -32,9 +32,9 @@ class GaussianMixture(SamplableDistribution):
             covs (Tensor): Covariance matrices of the Gaussian components.
             weights (Tensor): Weights of the Gaussian components.
         """
-        self.weights = weights
-        self.means = means
-        self.covs = covs
+        self.weights = weights.to(dtype=torch.float32)
+        self.means = means.to(dtype=torch.float32)
+        self.covs = covs.to(dtype=torch.float32)
         self.sample_batch_size = sample_batch_size
 
         self.category = torch.distributions.Categorical(self.weights)
