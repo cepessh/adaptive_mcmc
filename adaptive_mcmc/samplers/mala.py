@@ -48,11 +48,11 @@ class MALAIter(base_sampler.MHIteration):
                 (self.cache.point - proposal_point
                  - 0.5 * params.sigma ** 2 * grad_y) / params.sigma
             )
-            accept_prob = torch.clamp((logp_y + log_qxy - self.cache.logp - log_qyx).exp(), max=1).detach()
+            accept_prob = torch.clamp((logp_y + log_qxy - self.cache.logp - log_qyx).exp(), max=1.).detach()
 
             params.sigma = params.sigma * (
                 1 + params.sigma_lr * (
-                    accept_prob[..., None] - params.target_acceptance
+                    accept_prob.unsqueeze(-1) - params.target_acceptance
                 )
             ) ** 0.5
 

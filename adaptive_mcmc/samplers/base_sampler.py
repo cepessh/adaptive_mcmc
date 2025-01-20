@@ -81,7 +81,7 @@ class Iteration(ABC):
 
 @dataclass
 class MHIteration(Iteration):
-    def MHStep(self, point_new, logp_new, grad_new, accept_prob) -> None:
+    def MHStep(self, point_new: Tensor, logp_new: Tensor, grad_new: Tensor, accept_prob: Tensor) -> None:
         with torch.no_grad():
             mask = torch.rand_like(accept_prob, device=self.params.device) < accept_prob
 
