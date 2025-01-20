@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+
 import torch
 from torch import Tensor
 
@@ -25,7 +25,7 @@ class SamplableDistribution(Distribution):
 class GaussianMixture(SamplableDistribution):
     """Gaussian Mixture Model distribution."""
 
-    def __init__(self, means: Tensor, covs: Tensor, weights: Tensor):
+    def __init__(self, means: Tensor, covs: Tensor, weights: Tensor, sample_batch_size=256):
         """
         Args:
             means (Tensor): Means of the Gaussian components.
@@ -33,28 +33,45 @@ class GaussianMixture(SamplableDistribution):
             weights (Tensor): Weights of the Gaussian components.
         """
         self.weights = weights
-        self.category = torch.distributions.Categorical(self.weights)
         self.means = means
         self.covs = covs
+        self.sample_batch_size = sample_batch_size
 
-    def sample(self, sample_count: int) -> Tensor:
+        self.category = torch.distributions.Categorical(self.weights)
+        self.gaussians = torch.distributions.MultivariateNormal(
+            loc=self.means,
+            covariance_matrix=self.covs
+        )
+
+    def _sample(self, sample_count: int) -> Tensor:
         """
         Generates samples from the Gaussian mixture distribution.
-        
+
         Args:
             sample_count (int): Number of samples to generate.
 
         Returns:
             Tensor: Generated samples.
         """
-        which_gaussian = self.category.sample(torch.Size((sample_count,)))
-        chosen_means = self.means[which_gaussian]
-        chosen_covs = self.covs[which_gaussian]
-        
-        multivariate_normal = torch.distributions.MultivariateNormal(
-            loc=chosen_means, covariance_matrix=chosen_covs
-        )
-        return multivariate_normal.sample()
+        which_gaussian = self.category.sample((sample_count,))
+        all_samples = self.gaussians.sample((sample_count,))
+
+        return all_samples[range(sample_count), which_gaussian, :]
+
+    def sample(self, sample_count: int) -> Tensor:
+        """
+        Generates samples from the Gaussian mixture distribution.
+
+        Args:
+            sample_count (int): Number of samples to generate.
+
+        Returns:
+            Tensor: Generated samples.
+        """
+        all_samples = []
+        for i in range(0, sample_count, self.sample_batch_size):
+            all_samples.append(self._sample(min(self.sample_batch_size, sample_count - i)))
+        return torch.cat(all_samples, dim=0)
 
     def log_prob(self, z: Tensor) -> Tensor:
         """
@@ -66,9 +83,6 @@ class GaussianMixture(SamplableDistribution):
         Returns:
             Tensor: Log probabilities of the input data.
         """
-        logs = torch.distributions.MultivariateNormal(
-            loc=self.means, covariance_matrix=self.covs
-        ).log_prob(z[:, None, :])
-        logs += torch.log(self.weights)
+        logs = self.gaussians.log_prob(z.unsqueeze(-2)) + torch.log(self.weights)
 
         return torch.logsumexp(logs, dim=1)
