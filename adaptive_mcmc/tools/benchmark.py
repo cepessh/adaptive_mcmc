@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import time
-from typing import Callable, Dict, Optional, Tuple, Union
+from typing import Callable, Union
 
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
@@ -17,12 +17,14 @@ class BenchmarkUtils:
     @staticmethod
     def generate_starting_points(chain_count: int, dimension: int,
                                  mass_points: Tensor, distance: float) -> Tensor:
-        starting_points = Tensor(chain_count, dimension).uniform_(-1, 1)
-        starting_points /= torch.norm(starting_points, dim=1).reshape(-1, 1)
+        direction = Tensor(chain_count, dimension).uniform_(-1, 1)
+        direction /= torch.norm(direction, dim=1, p=2, keepdim=True)
 
         length = Tensor(chain_count).uniform_(0, distance).reshape(-1, 1)
-        return mass_points[torch.randint(0, len(mass_points), (chain_count,))] + \
-                           starting_points * length
+        return (
+            mass_points[torch.randint(0, len(mass_points), (chain_count,))]
+            + direction * length
+        )
 
     @staticmethod
     def sample_mcmc(sampling_algorithm: Callable, starting_points: Tensor,
@@ -46,23 +48,24 @@ class BenchmarkUtils:
         mcmc_first_ax = 0
 
         if true_samples is not None:
-            fig, axes = plt.subplots(nrows=chain_count+1, ncols=1,
-                                     figsize=(fig_side, fig_side*(chain_count+1)))
+            fig, axes = plt.subplots(nrows=chain_count + 1, ncols=1,
+                                     figsize=(fig_side, fig_side * (chain_count + 1)))
             BenchmarkUtils.plot_samples(axes[0], true_samples, target_title)
             mcmc_first_ax = 1
         else:
             fig, axes = plt.subplots(nrows=chain_count, ncols=1,
-                                     figsize=(fig_side, fig_side*chain_count))
+                                     figsize=(fig_side, fig_side * chain_count))
 
         for chain_index, ax in enumerate(axes[mcmc_first_ax:]):
             BenchmarkUtils.plot_samples(ax, mcmc_samples[:, chain_index],
-                                        f"chain_{chain_index+1}")
+                                        f"chain_{chain_index + 1}")
 
     @staticmethod
     def compute_metrics(mcmc_samples: Tensor, true_samples: Tensor,
                         **kwargs) -> dict:
         return metrics.compute_metrics(jnp.array(true_samples),
                                        jnp.array(mcmc_samples), **kwargs)
+
 
 @dataclass
 class Benchmark:
