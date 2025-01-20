@@ -60,7 +60,7 @@ class Iteration(ABC):
     params: Params = field(default_factory=Params)
 
     def init(self) -> None:
-        self.cache.point = self.params.starting_point.requires_grad_()
+        self.cache.point = self.params.starting_point.clone().requires_grad_()
         self.cache.logp = self.params.target_dist.log_prob(self.cache.point)
         self.cache.grad = torch.autograd.grad(
             self.cache.logp.sum(),
@@ -74,9 +74,9 @@ class Iteration(ABC):
 
     def collect_sample(self, sample: Tensor):
         if self.cache.samples is None:
-            self.cache.samples = sample[None, ...]
+            self.cache.samples = sample.unsqueeze(0)
         else:
-            self.cache.samples = torch.cat([self.cache.samples, sample[None, ...]], 0)
+            self.cache.samples = torch.cat([self.cache.samples, sample.unsqueeze(0)], 0)
 
 
 @dataclass
