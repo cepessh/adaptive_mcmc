@@ -22,15 +22,15 @@ def h(z: Tensor, v: Tensor, sigma: Tensor, prec_factors: list[Tensor],
     logp_v = target_dist.log_prob(v)
     grad_v = torch.autograd.grad(logp_v.sum(), v)[0].detach()
 
-    grad_v_img = prec_factors[-1] @ grad_v[..., None]
+    grad_v_img = torch.einsum("...ij,...j->...i", prec_factors[-1], grad_v)
     for factor in reversed(prec_factors[:-1]):
-        grad_v_img = factor @ grad_v_img
+        grad_v_img = torch.einsum("...ij,...j->...i", factor, grad_v_img)
 
-    grad_v_img = grad_v_img.squeeze()
-
-    return 0.5 * (
-        grad_v[:, None, :] @ (z - v - 0.25 * grad_v_img * sigma[..., None] ** 2)[..., None]
-    ).squeeze()
+    return 0.5 * torch.einsum(
+        "...i,...i->...",
+        grad_v,
+        z - v - 0.25 * torch.einsum("...i,...->...i", grad_v_img, sigma ** 2)
+    )
 
 
 @dataclass
@@ -44,8 +44,14 @@ class FisherMALAParams(base_sampler.Params):
 
 
 @dataclass
-class FisherMALAIter(base_sampler.Iteration):
+class AdaptiveCache(base_sampler.Cache):
+    prec: Optional[Tensor] = None
+
+
+@dataclass
+class FisherMALAIter(base_sampler.MHIteration):
     params: FisherMALAParams = field(default_factory=FisherMALAParams)
+    cache: AdaptiveCache = field(default_factory=AdaptiveCache)
 
     def init(self):
         super().init()
@@ -55,89 +61,87 @@ class FisherMALAIter(base_sampler.Iteration):
         if self.params.prec is None:
             self.params.prec = torch.eye(self.cache.point.shape[-1]).repeat(*self.cache.point.shape[:-1], 1, 1)
 
-        """
-        sigma_prec: (chain_count, 1, 1)
-        """
         if isinstance(self.params.sigma, float):
             self.params.sigma_prec = Tensor([self.params.sigma]).repeat(*self.cache.point.shape[:-1], 1, 1)
             self.params.sigma = Tensor([self.params.sigma]).repeat(*self.cache.point.shape[:-1], 1)
         else:
             self.params.sigma = self.params.sigma.reshape(*self.cache.point.shape[:-1], 1)
-            self.params.sigma_prec = self.params.sigma
-            while len(self.params.sigma_prec.shape) < 3:
-                self.params.sigma_prec = self.params.sigma_prec[..., None]
+            self.params.sigma_prec = self.params.sigma.clone()
 
-    def run(self):
-        params = self.params
-
-        h_ = partial(h, prec_factors=[params.prec, params.prec.permute(0, 2, 1)],
-                     target_dist=params.target_dist, sigma=params.sigma_prec.squeeze())
-
-        noise = params.proposal_dist.sample(self.cache.point.shape[:-1])
-
-        grad_x_img = self.cache.grad[..., None]
-        grad_x_img = params.prec @ (params.prec.permute(0, 2, 1) @ grad_x_img)
-
-        proposal_point = (
-            self.cache.point + (
-                0.5 * grad_x_img * params.sigma_prec ** 2
-                + params.prec @ noise[..., None] * params.sigma_prec
-            ).squeeze()
-        )
-        proposal_point = proposal_point.detach().requires_grad_()
-
-        logp_y = params.target_dist.log_prob(proposal_point)
-        grad_y = torch.autograd.grad(logp_y.sum(), proposal_point)[0].detach()
-
-        accept_prob = torch.clamp(
-            torch.exp(
-                logp_y + h_(self.cache.point, proposal_point)
-                - self.cache.logp - h_(proposal_point, self.cache.point)
-            ),
-            max=1
-        ).detach()
-
+    def _adapt(self, accept_prob: Tensor, grad_new: Tensor, ):
         with torch.no_grad():
+            signal_adaptation = torch.sqrt(accept_prob).unsqueeze(-1) * (grad_new - self.cache.grad)
 
-            signal_adaptation = torch.sqrt(accept_prob)[..., None] * (grad_y - self.cache.grad)
-
-            phi_n = params.prec.permute(0, 2, 1) @ signal_adaptation[..., None]
-
-            gramm_diag = phi_n.permute(0, 2, 1) @ phi_n
+            phi_n = torch.einsum("...ji,...j->...i", self.params.prec, signal_adaptation)
+            gramm_diag = torch.square(phi_n).sum(dim=-1, keepdim=True).unsqueeze(-1)
 
             if self.step_id == 0:
-                r_1 = 1. / (1 + torch.sqrt(params.dampening / (params.dampening + gramm_diag)))
-                shift = phi_n @ phi_n.permute(0, 2, 1)
-                params.prec = 1. / params.dampening ** 0.5 * (
-                    params.prec - shift * r_1 / (params.dampening + gramm_diag)
+                r_1 = 1. / (1 + torch.sqrt(self.params.dampening / (self.params.dampening + gramm_diag)))
+                shift = torch.einsum("...i,...j->...ij", phi_n, phi_n)
+                self.params.prec = 1. / self.params.dampening ** 0.5 * (
+                    self.params.prec - shift * r_1 / (self.params.dampening + gramm_diag)
                 )
             else:
                 r_n = 1. / (1 + torch.sqrt(1 / (1 + gramm_diag)))
-                shift = (params.prec @ phi_n) @ phi_n.permute(0, 2, 1)
-                params.prec = params.prec - shift * r_n / (1 + gramm_diag)
+                shift = torch.einsum(
+                    "...i,...j->...ij",
+                    torch.einsum("...ij,...j->...i", self.params.prec, phi_n),
+                    phi_n,
+                )
+                self.params.prec = self.params.prec - shift * r_n / (1 + gramm_diag)
 
-            params.sigma = params.sigma * (
-                1 + params.sigma_lr * (accept_prob[..., None] - params.target_acceptance)
+            self.params.sigma = self.params.sigma * (
+                1 + self.params.sigma_lr * (accept_prob.unsqueeze(-1) - self.params.target_acceptance)
             ) ** 0.5
 
-            trace_prec = (params.prec[..., None, :] @ params.prec[..., None]).sum(dim=1)
+            trace_prec = torch.square(self.params.prec).sum(dim=[-2, -1]).unsqueeze(-1)
             normalizer = (1. / self.cache.point.shape[-1]) * trace_prec
-            params.sigma_prec = params.sigma[..., None] / normalizer ** 0.5
-
-            mask = torch.rand_like(accept_prob) < accept_prob
-
-            self.cache.point[mask] = proposal_point[mask]
-            self.cache.logp[mask] = logp_y[mask]
-            self.cache.grad[mask] = grad_y[mask]
+            self.params.sigma_prec = self.params.sigma / normalizer ** 0.5
 
         self.cache.point = self.cache.point.detach().requires_grad_()
 
-        if self.cache.samples is None:
-            self.cache.samples = self.cache.point.detach().clone()[None, ...]
-        else:
-            self.cache.samples = torch.cat([self.cache.samples, self.cache.point.detach().clone()[None, ...]], 0)
+    def run(self):
+        h_ = partial(h, prec_factors=[self.params.prec, self.params.prec.permute(0, 2, 1)],
+                     target_dist=self.params.target_dist, sigma=self.params.sigma_prec.squeeze(-1))
 
+        noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
+
+        grad_x_img = torch.einsum(
+            "...ij,...j->...i",
+            self.params.prec,
+            torch.einsum("...ji,...j->...i", self.params.prec, self.cache.grad)
+        )
+
+        point_new = (
+            self.cache.point + (
+                0.5 * grad_x_img * self.params.sigma_prec ** 2
+                + torch.einsum("...ij,...j->...i", self.params.prec, noise) * self.params.sigma_prec
+            ).squeeze()
+        )
+
+        point_new = point_new.detach().requires_grad_()
+
+        logp_new = self.params.target_dist.log_prob(point_new)
+        grad_new = torch.autograd.grad(logp_new.sum(), point_new)[0].detach()
+
+        accept_prob = torch.clamp(
+            torch.exp(
+                logp_new + h_(self.cache.point, point_new)
+                - self.cache.logp - h_(point_new, self.cache.point)
+            ),
+            max=1.
+        ).detach()
+
+        self.MHStep(
+            point_new=point_new,
+            logp_new=logp_new,
+            grad_new=grad_new,
+            accept_prob=accept_prob,
+        )
+        self.collect_sample(self.cache.point.detach().clone())
         self.step_id += 1
+
+        self._adapt(accept_prob=accept_prob, grad_new=grad_new)
 
 
 @dataclass
