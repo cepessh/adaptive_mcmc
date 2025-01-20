@@ -101,13 +101,13 @@ class HMCAdaptiveIter(HMCIter):
             self.params.entropy_weight = Tensor([self.params.entropy_weight]).repeat(*self.cache.point.shape[:-1], 1)
         else:
             while len(self.params.entropy_weight.shape) < 2:
-                self.params.entropy_weight = self.params.entropy_weight[..., None]
+                self.params.entropy_weight = self.params.entropy_weight.unsqueeze(-1)
 
         if isinstance(self.params.penalty_weight, float):
             self.params.penalty_weight = Tensor([self.params.penalty_weight]).repeat(*self.cache.point.shape[:-1], 1)
         else:
             while len(self.params.penalty_weight.shape) < 2:
-                self.params.penalty_weight = self.params.penalty_weight[..., None]
+                self.params.penalty_weight = self.params.penalty_weight.unsqueeze(-1)
 
         if self.cache.optimizer is None:
             self.cache.optimizer = self.params.optimizer_cls(
@@ -151,11 +151,11 @@ class HMCAdaptiveIter(HMCIter):
 
         while trajectory is None:
             noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
-            p = torch.linalg.solve(self.cache.prec, noise)
-
-            while torch.isnan(p).any().item():
-                noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
-                p = torch.linalg.solve(self.cache.prec, noise)
+            p = torch.linalg.solve_triangular(
+                torch.einsum("...ij->...ji", self.cache.prec),
+                noise.unsqueeze(-1),
+                upper=True,
+            ).squeeze(-1)
 
             trajectory = self.lf_intergrator.run(
                 q=self.cache.point,
@@ -248,12 +248,17 @@ class HMCAdaptiveIter(HMCIter):
         # TODO: try batch update, i.e. accumulate the gradient and step once every kth iteration
         self.cache.optimizer.zero_grad()
         loss.backward()
+
+        for param in self.cache.optimizer.param_groups[0]['params']:
+            if param.grad is not None and torch.isnan(param.grad).any().item():
+                param.grad.zero_()
+
         self.cache.optimizer.step()
 
         with torch.no_grad():
             self.params.entropy_weight = torch.clamp(
                 self.params.entropy_weight * (
-                    1 + self.params.entropy_weight_adaptive_rate * (accept_prob[..., None] - self.params.target_acceptance)
+                    1 + self.params.entropy_weight_adaptive_rate * (accept_prob.unsqueeze(-1) - self.params.target_acceptance)
                 ),
                 min=self.params.entropy_weight_min,
                 max=self.params.entropy_weight_max,
