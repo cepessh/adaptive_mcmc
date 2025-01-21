@@ -30,7 +30,7 @@ class Leapfrog():
 
         with context:
             p_half = p_prev + 0.5 * step_size * gradq_prev
-            q_next = q_prev + step_size * torch.bmm(Minv, p_half.unsqueeze(-1)).squeeze(-1)
+            q_next = q_prev + step_size * torch.einsum("...ij,...j->...i", Minv, p_half)
 
         if stop_grad:
             q_next = q_next.detach().requires_grad_()
@@ -38,7 +38,7 @@ class Leapfrog():
             q_next = q_next.requires_grad_()
 
         logq_next = target_dist.log_prob(q_next)
-        gradq_next = torch.autograd.grad(logq_next.sum(), q_next, retain_graph=True)[0]
+        gradq_next = torch.autograd.grad(logq_next.sum(), q_next, retain_graph=not no_grad)[0]
 
         if stop_grad:
             gradq_next = gradq_next.detach().requires_grad_()
