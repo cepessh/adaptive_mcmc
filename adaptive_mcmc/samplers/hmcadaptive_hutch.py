@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+import math
 from typing import Callable, Optional, Tuple, Type
 
 import numpy as np
@@ -25,8 +26,25 @@ def default_penalty_fn(x: Tensor) -> Tensor:
     return penalty
 
 
+class WarmupCosineAnnealingScheduler(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_epochs, total_epochs, eta_min=0, last_epoch=-1):
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.eta_min = eta_min
+        super(WarmupCosineAnnealingScheduler, self).__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        if self.last_epoch < self.warmup_epochs:
+            warmup_factor = (self.last_epoch + 1) / self.warmup_epochs
+            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+        else:
+            progress = (self.last_epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            cosine_factor = 0.5 * (1 + math.cos(math.pi * progress))
+            return [self.eta_min + (base_lr - self.eta_min) * cosine_factor for base_lr in self.base_lrs]
+
+
 @dataclass
-class HMCAdaptiveParams(HMCParams):
+class HMCAdaptiveHutchParams(HMCParams):
     truncation_level_prob: float = 0.5
     min_truncation_level: int = 2
     spectral_normalization_decay: float = 0.99
@@ -44,7 +62,12 @@ class HMCAdaptiveParams(HMCParams):
     penalty_weight_adaptive_rate: float = 1e-2
 
     stop_grad: bool = False
+    clip_grad_value: float = 1e3
+
     optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam
+    scheduler_cls: Type[WarmupCosineAnnealingScheduler] = WarmupCosineAnnealingScheduler
+
+    iter_count: int = 1000
 
     def __post__init__(self):
         self.no_grad = False
@@ -81,12 +104,13 @@ class CholeskyParametrization:
 class AdaptiveCache(base_sampler.Cache):
     prec_params: Optional[CholeskyParametrization] = None
     optimizer: Optional[torch.optim.Optimizer] = None
+    scheduler: Optional[torch.torch.optim.lr_scheduler._LRScheduler] = None
 
 
 @dataclass
-class HMCAdaptiveIter(HMCIter):
+class HMCAdaptiveHutchIter(HMCIter):
     cache: AdaptiveCache = field(default_factory=AdaptiveCache)
-    params: HMCAdaptiveParams = field(default_factory=HMCAdaptiveParams)
+    params: HMCAdaptiveHutchParams = field(default_factory=HMCAdaptiveHutchParams)
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
 
     def init(self):
@@ -116,6 +140,13 @@ class HMCAdaptiveIter(HMCIter):
             self.cache.optimizer = self.params.optimizer_cls(
                 [self.cache.prec_params.params],
                 lr=self.params.learning_rate
+            )
+
+        if self.cache.scheduler is None:
+            self.cache.scheduler = self.params.scheduler_cls(
+                self.cache.optimizer,
+                warmup_epochs=int(0.05 * self.params.iter_count),
+                total_epochs=self.params.iter_count,
             )
 
         def grad_logp(v: Tensor) -> Tensor:
@@ -208,9 +239,14 @@ class HMCAdaptiveIter(HMCIter):
         self.cache.optimizer.zero_grad()
         loss.backward()
 
-        for param in self.cache.optimizer.param_groups[0]['params']:
-            if param.grad is not None and torch.isnan(param.grad).any().item():
-                param.grad.zero_()
+        torch.nn.utils.clip_grad_value_(
+            self.cache.optimizer.param_groups[0]["params"],
+            clip_value=self.params.clip_grad_value,
+        )
+
+        # for param in self.cache.optimizer.param_groups[0]['params']:
+        #     if param.grad is not None and torch.isnan(param.grad).any().item():
+        #         param.grad.zero_()
 
         self.cache.optimizer.step()
 
@@ -233,8 +269,8 @@ class HMCAdaptiveIter(HMCIter):
 
 
 @dataclass
-class HMCAdaptiveVanilla(base_sampler.AlgorithmStoppingRule):
-    params: HMCAdaptiveParams
+class HMCAdaptiveHutch(base_sampler.AlgorithmStoppingRule):
+    params: HMCAdaptiveHutchParams
     burn_in_iter_count: int
     sample_iter_count: int
     probe_period: int
@@ -243,11 +279,11 @@ class HMCAdaptiveVanilla(base_sampler.AlgorithmStoppingRule):
     def load_params(self, params: base_sampler.Params):
         self.pipeline = base_sampler.Pipeline([
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveIter(params=params.copy_update(params)),
+                iteration=HMCAdaptiveHutchIter(params=params.copy_update(params)),
                 iteration_count=self.burn_in_iter_count,
             ),
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveIter(params=params.copy_update(params)),
+                iteration=HMCAdaptiveHutchIter(params=params.copy_update(params)),
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
