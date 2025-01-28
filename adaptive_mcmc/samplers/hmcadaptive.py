@@ -44,7 +44,7 @@ class WarmupCosineAnnealingScheduler(torch.optim.lr_scheduler._LRScheduler):
 
 
 @dataclass
-class HMCAdaptiveHutchParams(HMCParams):
+class HMCAdaptiveParams(HMCParams):
     truncation_level_prob: float = 0.5
     min_truncation_level: int = 2
     spectral_normalization_decay: float = 0.99
@@ -65,9 +65,10 @@ class HMCAdaptiveHutchParams(HMCParams):
     clip_grad_value: float = 1e3
 
     optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam
-    scheduler_cls: Type[WarmupCosineAnnealingScheduler] = WarmupCosineAnnealingScheduler
+    scheduler_cls: Optional[Type[WarmupCosineAnnealingScheduler]] = None
 
-    iter_count: int = 1000
+    iter_count: Optional[int] = None
+    warm_up_ratio: float = 0.05
 
     def __post__init__(self):
         self.no_grad = False
@@ -108,9 +109,9 @@ class AdaptiveCache(base_sampler.Cache):
 
 
 @dataclass
-class HMCAdaptiveHutchIter(HMCIter):
+class HMCAdaptiveIter(HMCIter):
     cache: AdaptiveCache = field(default_factory=AdaptiveCache)
-    params: HMCAdaptiveHutchParams = field(default_factory=HMCAdaptiveHutchParams)
+    params: HMCAdaptiveParams = field(default_factory=HMCAdaptiveParams)
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
 
     def init(self):
@@ -124,17 +125,16 @@ class HMCAdaptiveHutchIter(HMCIter):
                 device=self.params.device,
             )
 
-        if isinstance(self.params.entropy_weight, float):
-            self.params.entropy_weight = Tensor([self.params.entropy_weight]).repeat(*self.cache.point.shape[:-1], 1)
-        else:
-            while len(self.params.entropy_weight.shape) < 2:
-                self.params.entropy_weight = self.params.entropy_weight.unsqueeze(-1)
+        def ensure_tensor(param, shape):
+            if isinstance(param, float):
+                param = Tensor([param]).repeat(*shape, 1)
+            else:
+                while len(param.shape) < 2:
+                    param = param.unsqueeze(-1)
+            return param
 
-        if isinstance(self.params.penalty_weight, float):
-            self.params.penalty_weight = Tensor([self.params.penalty_weight]).repeat(*self.cache.point.shape[:-1], 1)
-        else:
-            while len(self.params.penalty_weight.shape) < 2:
-                self.params.penalty_weight = self.params.penalty_weight.unsqueeze(-1)
+        self.params.entropy_weight = ensure_tensor(self.params.entropy_weight, self.cache.point.shape[:-1])
+        self.params.penalty_weight = ensure_tensor(self.params.penalty_weight, self.cache.point.shape[:-1])
 
         if self.cache.optimizer is None:
             self.cache.optimizer = self.params.optimizer_cls(
@@ -142,10 +142,10 @@ class HMCAdaptiveHutchIter(HMCIter):
                 lr=self.params.learning_rate
             )
 
-        if self.cache.scheduler is None:
+        if self.cache.scheduler is None and self.params.scheduler_cls is not None:
             self.cache.scheduler = self.params.scheduler_cls(
                 self.cache.optimizer,
-                warmup_epochs=int(0.05 * self.params.iter_count),
+                warmup_epochs=int(self.params.warm_up_ratio * self.params.iter_count),
                 total_epochs=self.params.iter_count,
             )
 
@@ -180,6 +180,7 @@ class HMCAdaptiveHutchIter(HMCIter):
 
     def run(self):
         self.cache.prec = self.cache.prec_params.make_prec()
+        self.params.prec = self.cache.prec
         Minv = torch.einsum("...ij,...kj->...ik", self.cache.prec, self.cache.prec)
 
         ret = self._run_iter(prec=self.cache.prec, Minv=Minv)
@@ -244,11 +245,9 @@ class HMCAdaptiveHutchIter(HMCIter):
             clip_value=self.params.clip_grad_value,
         )
 
-        # for param in self.cache.optimizer.param_groups[0]['params']:
-        #     if param.grad is not None and torch.isnan(param.grad).any().item():
-        #         param.grad.zero_()
-
         self.cache.optimizer.step()
+        if self.cache.scheduler is not None:
+            self.cache.scheduler.step()
 
         with torch.no_grad():
             self.params.entropy_weight = torch.clamp(
@@ -269,8 +268,8 @@ class HMCAdaptiveHutchIter(HMCIter):
 
 
 @dataclass
-class HMCAdaptiveHutch(base_sampler.AlgorithmStoppingRule):
-    params: HMCAdaptiveHutchParams
+class HMCAdaptive(base_sampler.AlgorithmStoppingRule):
+    params: HMCAdaptiveParams
     burn_in_iter_count: int
     sample_iter_count: int
     probe_period: int
@@ -279,11 +278,11 @@ class HMCAdaptiveHutch(base_sampler.AlgorithmStoppingRule):
     def load_params(self, params: base_sampler.Params):
         self.pipeline = base_sampler.Pipeline([
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveHutchIter(params=params.copy_update(params)),
+                iteration=HMCAdaptiveIter(params=params.copy_update(params)),
                 iteration_count=self.burn_in_iter_count,
             ),
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveHutchIter(params=params.copy_update(params)),
+                iteration=HMCIter(params=params.copy_update(params)),
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
