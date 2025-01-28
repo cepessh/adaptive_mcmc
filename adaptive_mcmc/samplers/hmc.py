@@ -15,6 +15,7 @@ class HMCParams(base_sampler.Params):
     prec: Optional[Tensor] = None
     Minv: Optional[Tensor] = None
     lf_step_size: float = 1e-2
+    lf_step_size_adaptive_rate: float = 1e-2
     lf_step_count: int = 5
     target_acceptance: float = 0.65
     stop_grad: bool = False
@@ -111,6 +112,9 @@ class HMCIter(base_sampler.MHIteration):
                 stop_grad=self.params.stop_grad,
                 no_grad=self.params.no_grad,
             )
+
+            if trajectory is None:
+                self.params.lf_step_size *= 1 - self.params.lf_step_size_adaptive_rate
 
         context = torch.no_grad() if self.params.no_grad else nullcontext()
 
