@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
+from enum import Enum
 import math
-from typing import Callable, Optional, Tuple, Type
+from typing import Callable, Optional, Type
 
 import numpy as np
 import torch
@@ -8,6 +9,12 @@ from torch import Tensor
 
 from adaptive_mcmc.samplers import base_sampler
 from adaptive_mcmc.samplers.hmc import HMCParams, HMCIter, Leapfrog
+from adaptive_mcmc.linalg.logdet import lanczos_trace_estimator, taylor_trace_estimator
+
+
+class TraceMethod(str, Enum):
+    HUTCH_TAYLOR = "hutch_taylor_roulette"
+    HUTCH_LANCZOS = "hutch_lanczos"
 
 
 def default_penalty_fn(x: Tensor) -> Tensor:
@@ -45,9 +52,14 @@ class WarmupCosineAnnealingScheduler(torch.optim.lr_scheduler._LRScheduler):
 
 @dataclass
 class HMCAdaptiveParams(HMCParams):
+    trace_method: TraceMethod = TraceMethod.HUTCH_TAYLOR
     truncation_level_prob: float = 0.5
     min_truncation_level: int = 2
     spectral_normalization_decay: float = 0.99
+
+    lanczos_steps: int = 5
+    krylov_probe_vectors: int = 5
+
     learning_rate: float = 5e-3
 
     entropy_weight: float = 1.
@@ -69,6 +81,8 @@ class HMCAdaptiveParams(HMCParams):
 
     iter_count: Optional[int] = None
     warm_up_ratio: float = 0.05
+
+    prec_init_scale: float = 1e-2
 
     def __post__init__(self):
         self.no_grad = False
@@ -114,16 +128,19 @@ class HMCAdaptiveIter(HMCIter):
     params: HMCAdaptiveParams = field(default_factory=HMCAdaptiveParams)
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
 
-    def init(self):
-        super().init()
+    def init(self, cache: AdaptiveCache = None):
+        base_sampler.MHIteration.init(self)
         self.step_id = 0
 
-        if self.cache.prec_params is None:
+        if cache is None:
             self.cache.prec_params = CholeskyParametrization(
                 batch_size=self.cache.point.shape[0],
                 dimension=self.cache.point.shape[-1],
                 device=self.params.device,
+                scale=self.params.prec_init_scale,
             )
+        else:
+            self.cache = cache
 
         def ensure_tensor(param, shape):
             if isinstance(param, float):
@@ -171,16 +188,17 @@ class HMCAdaptiveIter(HMCIter):
 
         self.DL = DL
 
-        def geometric_cdf(k):
-            if k < self.params.min_truncation_level:
+        def dist_cdf(k):
+            if k <= self.params.min_truncation_level:
                 return 0
-            return 1 - (1 - self.params.min_truncation_level) ** (k - self.params.min_truncation_level + 1)
-        self.geometric_cdf = geometric_cdf
-        self.geom_dist = torch.distributions.Geometric(self.params.truncation_level_prob)
+            return 1 - (1 - self.params.truncation_level_prob) ** (k - self.params.min_truncation_level)
+
+        self.truncation_dist_cdf = dist_cdf
+        self.truncation_dist = torch.distributions.Geometric(self.params.truncation_level_prob)
 
     def run(self):
+        # print(f"prec params={self.cache.prec_params.params}")
         self.cache.prec = self.cache.prec_params.make_prec()
-        self.params.prec = self.cache.prec
         Minv = torch.einsum("...ij,...kj->...ik", self.cache.prec, self.cache.prec)
 
         ret = self._run_iter(prec=self.cache.prec, Minv=Minv)
@@ -191,54 +209,86 @@ class HMCAdaptiveIter(HMCIter):
             grad_new=ret["grad_new"],
         )
 
-    def _normalized_trace_estimator(self, mid_traj: Tensor) -> Tuple[Tensor, Tensor]:
-        truncation_level = self.params.min_truncation_level
-        truncation_level += int(self.geom_dist.sample((1,)).item())
-
-        eps = torch.randint_like(mid_traj, low=0, high=2, device=self.params.device) * 2 - 1
-        cur_vec = eps
-
-        trace = torch.zeros_like(eps, device=self.params.device)
-        sign = -1
-
-        for i in range(1, truncation_level + 1):
-            cur_res = self.DL(mid_traj, cur_vec)
-
-            spectral_normalization = torch.clamp(
-                self.params.spectral_normalization_decay
-                * torch.norm(cur_vec, dim=-1, p=2) / torch.norm(cur_res, dim=-1, p=2),
-                max=1,
-            ).unsqueeze(-1)
-
-            cur_vec = spectral_normalization * cur_res
-            trace += sign / (1 - self.geometric_cdf(i)) * cur_vec
-            sign *= -1
-
-        return torch.einsum("...i,...i->...", trace, self.DL(mid_traj, eps)), cur_vec
-
     def _adapt(self, energy_error: Tensor, accept_prob: Tensor, trajectory: Tensor, grad_new: Tensor):
-        mid_traj = trajectory[1 + self.params.lf_step_count // 2]["q"]
+        mid_traj = trajectory[len(trajectory) // 2]["q"]
         dimension = grad_new.shape[-1]
-
-        ltheta, eta = self._normalized_trace_estimator(mid_traj)
-
-        b_n = eta / torch.norm(eta, p=2, dim=-1, keepdim=True)
-        mu_n = torch.einsum("...i,...i->...", b_n, self.DL(mid_traj, b_n)).unsqueeze(-1)
-
-        penalty = self.params.penalty_func(torch.abs(mu_n))
 
         loss = (
             -torch.clamp(-energy_error, max=0)
             - self.params.entropy_weight * (
                 dimension * np.log(self.params.lf_step_size)
                 + torch.log(self.cache.prec.diagonal(dim1=-2, dim2=-1).prod(dim=-1))
-                + ltheta - self.params.penalty_weight * penalty
             )
-        ).mean()
+        )
+
+        if self.params.trace_method == TraceMethod.HUTCH_TAYLOR:
+            def matvec(v: Tensor) -> Tensor:
+                return self.DL(mid_traj, v)
+
+            ltheta, eta = taylor_trace_estimator(
+                matvec=matvec,
+                dimension=mid_traj.shape[-1],
+                batch_size=mid_traj.shape[0],
+                min_truncation_level=self.params.min_truncation_level,
+                dist=self.truncation_dist,
+                dist_cdf=self.truncation_dist_cdf,
+                spectral_normalization_decay=self.params.spectral_normalization_decay,
+                device=self.params.device,
+            )
+
+            b_n = eta / torch.norm(eta, p=2, dim=-1, keepdim=True)
+            mu_n = torch.einsum("...i,...i->...", b_n, self.DL(mid_traj, b_n)).unsqueeze(-1)
+
+            penalty = self.params.penalty_func(torch.abs(mu_n))
+
+            loss = loss - self.params.entropy_weight * ltheta + self.params.penalty_weight * penalty
+
+        elif self.params.trace_method == TraceMethod.HUTCH_LANCZOS:
+            def matvec(v: Tensor) -> Tensor:
+                return v + self.DL(mid_traj, v)
+
+            ltheta = lanczos_trace_estimator(
+                matvec=matvec,
+                dimension=mid_traj.shape[-1],
+                batch_size=mid_traj.shape[0],
+                probe_vector_count=self.params.krylov_probe_vectors,
+                lanczos_steps=self.params.lanczos_steps,
+                device=self.params.device,
+            )
+
+            # with torch.no_grad():
+            #     def matvec(v: Tensor) -> Tensor:
+            #         return self.DL(mid_traj, v)
+
+            #     ltheta_2, _ = taylor_trace_estimator(
+            #         matvec=matvec,
+            #         dimension=mid_traj.shape[-1],
+            #         batch_size=mid_traj.shape[0],
+            #         min_truncation_level=self.params.min_truncation_level,
+            #         dist=self.truncation_dist,
+            #         dist_cdf=self.truncation_dist_cdf,
+            #         spectral_normalization_decay=self.params.spectral_normalization_decay,
+            #         device=self.params.device,
+            #     )
+
+            # print(ltheta.mean().item(), ltheta_2.mean().item())
+
+            loss = loss - self.params.entropy_weight * ltheta
+
+        loss = loss.mean()
+        # print(f"Loss={loss:.4}")
 
         # TODO: try batch update, i.e. accumulate the gradient and step once every kth iteration
         self.cache.optimizer.zero_grad()
+
+        # torch.autograd.set_detect_anomaly(True)
+
         loss.backward()
+
+        for p in self.cache.optimizer.param_groups[0]["params"]:
+            if p.grad is None:
+                continue
+            torch.nan_to_num_(p.grad, nan=0.0)
 
         torch.nn.utils.clip_grad_value_(
             self.cache.optimizer.param_groups[0]["params"],
@@ -258,13 +308,14 @@ class HMCAdaptiveIter(HMCIter):
                 max=self.params.entropy_weight_max,
             )
 
-            self.params.penalty_weight = torch.clamp(
-                self.params.penalty_weight * (
-                    1 + self.params.penalty_weight_adaptive_rate * penalty
-                ),
-                min=self.params.penalty_weight_min,
-                max=self.params.penalty_weight_max,
-            )
+            if self.params.trace_method == TraceMethod.HUTCH_TAYLOR:
+                self.params.penalty_weight = torch.clamp(
+                    self.params.penalty_weight * (
+                        1 + self.params.penalty_weight_adaptive_rate * penalty
+                    ),
+                    min=self.params.penalty_weight_min,
+                    max=self.params.penalty_weight_max,
+                )
 
 
 @dataclass
@@ -276,15 +327,23 @@ class HMCAdaptive(base_sampler.AlgorithmStoppingRule):
     stopping_rule: Callable
 
     def load_params(self, params: base_sampler.Params):
-        self.pipeline = base_sampler.Pipeline([
+        self.pipeline = base_sampler.Pipeline()
+
+        self.pipeline.append(
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveIter(params=params.copy_update(params)),
+                iteration=HMCAdaptiveIter(params=params),
                 iteration_count=self.burn_in_iter_count,
             ),
+        )
+
+        collect_iter = HMCAdaptiveIter(params=params)
+        collect_iter.collect_required = True
+
+        self.pipeline.append(
             base_sampler.SampleBlock(
-                iteration=HMCIter(params=params.copy_update(params)),
+                iteration=collect_iter,
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
             ),
-        ])
+        )
