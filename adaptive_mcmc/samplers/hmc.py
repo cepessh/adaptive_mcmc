@@ -47,6 +47,19 @@ class Leapfrog():
         with context:
             p_next = p_half + 0.5 * step_size * gradq_next
 
+        # nan_counts = {
+        #     "q_prev": torch.isnan(q_prev).sum().item(),
+        #     "p_prev": torch.isnan(p_prev).sum().item(),
+        #     "gradq_prev": torch.isnan(gradq_prev).sum().item(),
+        #     "Minv": torch.isnan(Minv).sum().item(),
+        #     'p_half': torch.isnan(p_half).sum().item(),
+        #     'q_next': torch.isnan(q_next).sum().item(),
+        #     'logq_next': torch.isnan(logq_next).sum().item(),
+        #     'gradq_next': torch.isnan(gradq_next).sum().item(),
+        #     'p_next': torch.isnan(p_next).sum().item(),
+        # }
+        # print(f"[Leapfrog.step] NaN counts: {nan_counts}")
+
         return {
             "q": q_next,
             "p": p_next,
@@ -62,12 +75,17 @@ class Leapfrog():
         trajectory = [ret]
 
         for step in range(step_count):
-            ret = self.step(
-                q_prev=ret["q"], p_prev=ret["p"], gradq_prev=ret["gradq"],
-                Minv=Minv, target_dist=target_dist, step_size=step_size,
-                stop_grad=stop_grad, no_grad=no_grad,
-            )
-            if any(torch.isnan(tensor).any().item() for tensor in [ret["q"], ret["p"], ret["gradq"]]):
+            # print(f"step={step}")
+            try:
+                ret = self.step(
+                    q_prev=ret["q"], p_prev=ret["p"], gradq_prev=ret["gradq"],
+                    Minv=Minv, target_dist=target_dist, step_size=step_size,
+                    stop_grad=stop_grad, no_grad=no_grad,
+                )
+                if any(torch.isnan(tensor).any().item() for tensor in [ret["q"], ret["p"], ret["gradq"]]):
+                    return None
+            # happens when NaNs are in ret self.step computation
+            except ValueError:
                 return None
 
             trajectory.append(ret)
@@ -80,21 +98,31 @@ class HMCIter(base_sampler.MHIteration):
     params: HMCParams = field(default_factory=HMCParams)
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
 
-    def init(self):
-        super().init()
+    def init(self, cache=None):
+        super().init(cache=None)
         self.step_id = 0
 
-        if hasattr(self.cache, "prec"):
+        if hasattr(self.cache, "prec") and self.cache.prec is not None:
             self.params.prec = self.cache.prec
             self.params.Minv = torch.einsum("...ij,...kj->...ik", self.cache.prec, self.cache.prec)
         elif self.params.prec is None:
             self.params.prec = torch.eye(self.cache.point.shape[-1], device=self.params.device).repeat(*self.cache.point.shape[:-1], 1, 1)
             self.params.Minv = self.params.prec
 
+        if cache is not None:
+            self.cache = cache
+
     def _run_iter(self, prec: Tensor, Minv: Tensor) -> dict:
         trajectory = None
         while trajectory is None:
             noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
+
+            # nan_prec   = torch.isnan(prec).sum().item()
+            # inf_prec   = torch.isinf(prec).sum().item()
+            # diag_prec  = prec.diagonal(dim1=-2, dim2=-1)
+            # min_diag   = diag_prec.min().item()
+            # print(f"prec NaNs={nan_prec}, Infs={inf_prec}, min(diag)={min_diag:.3e}")
+
             p = torch.linalg.solve_triangular(
                 torch.einsum("...ij->...ji", prec),
                 noise.unsqueeze(-1),
@@ -136,13 +164,20 @@ class HMCIter(base_sampler.MHIteration):
 
             accept_prob = torch.clamp(torch.exp(energy_error), max=1)
 
+            self.params.lf_step_size *= (1 + self.params.lf_step_size_adaptive_rate * (accept_prob.mean() - self.params.target_acceptance))
+            if self.step_id % 1000 == 0:
+                print(f"step_size={self.params.lf_step_size:.4f}")
+
             self.MHStep(
                 point_new=point_new,
                 logp_new=logp_new,
                 grad_new=grad_new,
                 accept_prob=accept_prob,
             )
-            self.collect_sample(self.cache.point.detach().clone())
+
+            if self.collect_required:
+                self.collect_sample(self.cache.point.detach().clone())
+
             self.step_id += 1
 
         return {
@@ -165,15 +200,23 @@ class HMCVanilla(base_sampler.AlgorithmStoppingRule):
     stopping_rule: Callable
 
     def load_params(self, params: base_sampler.Params):
-        self.pipeline = base_sampler.Pipeline([
+        self.pipeline = base_sampler.Pipeline()
+
+        self.pipeline.append(
             base_sampler.SampleBlock(
-                iteration=HMCIter(params=params.copy_update(params)),
+                iteration=HMCIter(params=params),
                 iteration_count=self.burn_in_iter_count,
             ),
+        )
+
+        collect_iter = HMCIter(params=params)
+        collect_iter.collect_required = True
+
+        self.pipeline.append(
             base_sampler.SampleBlock(
-                iteration=HMCIter(params=params.copy_update(params)),
+                iteration=collect_iter,
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
             ),
-        ])
+        )
