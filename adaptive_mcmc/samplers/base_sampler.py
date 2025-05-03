@@ -44,22 +44,24 @@ class Cache:
     point: Optional[Tensor] = None
     logp: Optional[Tensor] = None
     grad: Optional[Tensor] = None
+    accept_prob_hist: list[float] = field(default_factory=list[float])
 
 
 def update_params(params: Params, cache: Cache, new_params: Params) -> None:
-    if cache is None:
-        return
+    if new_params is not None:
+        params.update(new_params)
 
-    params.starting_point = cache.point
-    params.update(new_params)
+    if cache is not None:
+        params.starting_point = cache.point
 
 
 @dataclass
 class Iteration(ABC):
     cache: Cache = field(default_factory=Cache)
     params: Params = field(default_factory=Params)
+    collect_required: bool = False
 
-    def init(self) -> None:
+    def init(self, cache=None) -> None:
         self.cache.point = self.params.starting_point.clone().requires_grad_()
         self.cache.logp = self.params.target_dist.log_prob(self.cache.point)
         self.cache.grad = torch.autograd.grad(
@@ -88,6 +90,8 @@ class MHIteration(Iteration):
             self.cache.point[mask] = point_new[mask]
             self.cache.logp[mask] = logp_new[mask]
             self.cache.grad[mask] = grad_new[mask]
+
+            self.cache.accept_prob_hist.append(accept_prob.mean().item())
 
         self.cache.point = self.cache.point.detach().requires_grad_(self.cache.point.requires_grad)
         self.cache.logp = self.cache.logp.detach().requires_grad_(self.cache.logp.requires_grad)
@@ -121,8 +125,8 @@ class SampleBlock:
     pure_runtime: float = 0.
 
     def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None, progress: bool = True) -> Tuple[Cache, Params]:
-        update_params(self.iteration.params, cache, params)
-        self.iteration.init()
+        # update_params(self.iteration.params, cache, params)
+        self.iteration.init(cache)
         self.pure_runtime = 0.
 
         bar = tqdm.notebook.trange(self.iteration_count) if progress else range(self.iteration_count)
@@ -144,9 +148,12 @@ class SampleBlock:
 
 @dataclass
 class Pipeline:
-    sample_blocks: list[SampleBlock]
+    sample_blocks: list[SampleBlock] = field(default_factory=list[SampleBlock])
     runtime: float = 0.
     pure_runtime: float = 0.
+
+    def append(self, block: SampleBlock):
+        self.sample_blocks.append(block)
 
     @track_runtime
     def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None) -> None:
@@ -173,5 +180,5 @@ class Algorithm(ABC):
 
 @dataclass
 class AlgorithmStoppingRule(Algorithm):
-    def load_true_samples(self, true_samples: Tensor, node_index: int = -1) -> None:
+    def load_true_samples(self, true_samples: Tensor, node_index: int = 0) -> None:
         self.pipeline.sample_blocks[node_index].iteration.cache.true_samples = true_samples
