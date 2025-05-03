@@ -36,7 +36,7 @@ class BenchmarkUtils:
     @staticmethod
     def plot_samples(ax: plt.Axes, samples: Tensor,
                      title: Union[None, str] = None) -> None:
-        ax.scatter(samples[:, 0], samples[:, 1])
+        ax.scatter(samples[:, 0], samples[:, 1], alpha=0.15)
         if title is not None:
             ax.set_title(title)
 
