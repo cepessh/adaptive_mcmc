@@ -18,8 +18,8 @@ class MALAParams(base_sampler.Params):
 class MALAIter(base_sampler.MHIteration):
     params: MALAParams = field(default_factory=MALAParams)
 
-    def init(self):
-        super().init()
+    def init(self, cache=None):
+        super().init(cache)
 
         if isinstance(self.params.sigma, float):
             self.params.sigma = Tensor([self.params.sigma]).repeat(
@@ -62,7 +62,9 @@ class MALAIter(base_sampler.MHIteration):
             grad_new=grad_y,
             accept_prob=accept_prob,
         )
-        self.collect_sample(self.cache.point.detach().clone())
+
+        if self.params.collect_sample:
+            self.collect_sample(self.cache.point.detach().clone())
 
 
 @dataclass

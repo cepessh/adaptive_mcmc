@@ -53,8 +53,8 @@ class FisherMALAIter(base_sampler.MHIteration):
     params: FisherMALAParams = field(default_factory=FisherMALAParams)
     cache: AdaptiveCache = field(default_factory=AdaptiveCache)
 
-    def init(self):
-        super().init()
+    def init(self, cache=None):
+        super().init(cache)
         self.step_id = 0
 
         # TODO: move adaptive parameters like prec from params to cache
@@ -138,7 +138,10 @@ class FisherMALAIter(base_sampler.MHIteration):
             grad_new=grad_new,
             accept_prob=accept_prob,
         )
-        self.collect_sample(self.cache.point.detach().clone())
+
+        if self.params.collect_sample:
+            self.collect_sample(self.cache.point.detach().clone())
+
         self.step_id += 1
 
         self._adapt(accept_prob=accept_prob, grad_new=grad_new)
