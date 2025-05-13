@@ -38,6 +38,9 @@ class Params(ABC):
 
 @dataclass
 class Cache:
+    """
+    samples: (sample_count, chain_count, dimension)
+    """
     true_samples: Optional[Tensor] = None
     samples: Optional[Tensor] = None
 
@@ -60,6 +63,7 @@ class Iteration(ABC):
     cache: Cache = field(default_factory=Cache)
     params: Params = field(default_factory=Params)
     collect_required: bool = False
+    index: int = 0
 
     def init(self, cache=None) -> None:
         self.cache.point = self.params.starting_point.clone().requires_grad_()
@@ -75,10 +79,9 @@ class Iteration(ABC):
         raise NotImplementedError
 
     def collect_sample(self, sample: Tensor):
-        if self.cache.samples is None:
-            self.cache.samples = sample.unsqueeze(0)
-        else:
-            self.cache.samples = torch.cat([self.cache.samples, sample.unsqueeze(0)], 0)
+        assert self.cache.samples is not None
+        self.cache.samples[self.index] = sample.unsqueeze(0)
+        self.index += 1
 
 
 @dataclass
@@ -123,9 +126,18 @@ class SampleBlock:
     probe_period: Optional[int] = None
     stop_data_hist: list = field(default_factory=list)
     pure_runtime: float = 0.
+    callback: Optional[Callable] = None
 
     def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None, progress: bool = True) -> Tuple[Cache, Params]:
-        # update_params(self.iteration.params, cache, params)
+        update_params(self.iteration.params, cache, params)
+
+        if cache is not None:
+            if isinstance(cache, type(self.iteration.cache)):
+                self.iteration.cache = cache
+            else:
+                for name, value in vars(cache).items():
+                    setattr(self.iteration.cache, name, value)
+
         self.iteration.init(cache)
         self.pure_runtime = 0.
 
@@ -158,9 +170,28 @@ class Pipeline:
     @track_runtime
     def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None) -> None:
         print("number of blocks:", len(self.sample_blocks))
+
+        sample_count = 0
+        for block in self.sample_blocks:
+            shape = block.iteration.params.starting_point.shape
+            device = block.iteration.params.device
+            if block.iteration.collect_required:
+                block.iteration.index = sample_count
+                sample_count += block.iteration_count
+
+        samples = None
+        if sample_count:
+            samples = torch.empty(sample_count, *shape, device=device)
+        self.sample_blocks[0].iteration.cache.samples = samples
+
         for block_index, block in enumerate(self.sample_blocks):
             print("processing block:", block_index + 1)
+
             cache, params = block.run(cache, params)
+
+            if block.callback is not None:
+                block.callback()
+
             self.pure_runtime += block.pure_runtime
 
 
