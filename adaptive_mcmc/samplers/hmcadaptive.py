@@ -1,7 +1,7 @@
 from dataclasses import dataclass, field
 from enum import Enum
 import math
-from typing import Callable, Optional, Type
+from typing import Callable, Dict, List, Optional, Type
 
 import numpy as np
 import torch
@@ -15,6 +15,12 @@ from adaptive_mcmc.linalg.logdet import lanczos_trace_estimator, taylor_trace_es
 class TraceMethod(str, Enum):
     HUTCH_TAYLOR = "hutch_taylor_roulette"
     HUTCH_LANCZOS = "hutch_lanczos"
+
+
+class EntropyMethod(str, Enum):
+    NONE = "none"
+    FULL = "full"
+    LOCGAUS = "locgaus"
 
 
 def default_penalty_fn(x: Tensor) -> Tensor:
@@ -53,6 +59,8 @@ class WarmupCosineAnnealingScheduler(torch.optim.lr_scheduler._LRScheduler):
 @dataclass
 class HMCAdaptiveParams(HMCParams):
     trace_method: TraceMethod = TraceMethod.HUTCH_TAYLOR
+    entropy_method: EntropyMethod = EntropyMethod.LOCGAUS
+
     truncation_level_prob: float = 0.5
     min_truncation_level: int = 2
     spectral_normalization_decay: float = 0.99
@@ -84,7 +92,7 @@ class HMCAdaptiveParams(HMCParams):
 
     prec_init_scale: float = 1e-2
 
-    def __post__init__(self):
+    def __post_init__(self):
         self.no_grad = False
 
 
@@ -120,6 +128,7 @@ class AdaptiveCache(base_sampler.Cache):
     prec_params: Optional[CholeskyParametrization] = None
     optimizer: Optional[torch.optim.Optimizer] = None
     scheduler: Optional[torch.torch.optim.lr_scheduler._LRScheduler] = None
+    prec: Optional[Tensor] = None
 
 
 @dataclass
@@ -128,19 +137,17 @@ class HMCAdaptiveIter(HMCIter):
     params: HMCAdaptiveParams = field(default_factory=HMCAdaptiveParams)
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
 
-    def init(self, cache: AdaptiveCache = None):
+    def init(self, cache: Optional[base_sampler.Cache] = None):
         base_sampler.MHIteration.init(self)
         self.step_id = 0
 
-        if cache is None:
+        if self.cache.prec_params is None:
             self.cache.prec_params = CholeskyParametrization(
                 batch_size=self.cache.point.shape[0],
                 dimension=self.cache.point.shape[-1],
                 device=self.params.device,
                 scale=self.params.prec_init_scale,
             )
-        else:
-            self.cache = cache
 
         def ensure_tensor(param, shape):
             if isinstance(param, float):
@@ -195,9 +202,9 @@ class HMCAdaptiveIter(HMCIter):
 
         self.truncation_dist_cdf = dist_cdf
         self.truncation_dist = torch.distributions.Geometric(self.params.truncation_level_prob)
+        self.cache.prec = self.cache.prec_params.make_prec()
 
     def run(self):
-        # print(f"prec params={self.cache.prec_params.params}")
         self.cache.prec = self.cache.prec_params.make_prec()
         Minv = torch.einsum("...ij,...kj->...ik", self.cache.prec, self.cache.prec)
 
@@ -209,16 +216,13 @@ class HMCAdaptiveIter(HMCIter):
             grad_new=ret["grad_new"],
         )
 
-    def _adapt(self, energy_error: Tensor, accept_prob: Tensor, trajectory: Tensor, grad_new: Tensor):
+    def _locgaus_entropy_estimator(self, trajectory, grad_new) -> Tensor:
         mid_traj = trajectory[len(trajectory) // 2]["q"]
         dimension = grad_new.shape[-1]
 
-        loss = (
-            -torch.clamp(-energy_error, max=0)
-            - self.params.entropy_weight * (
-                dimension * np.log(self.params.lf_step_size)
-                + torch.log(self.cache.prec.diagonal(dim1=-2, dim2=-1).prod(dim=-1))
-            )
+        entropy = self.params.entropy_weight * (
+            dimension * np.log(self.params.lf_step_size)
+            + torch.log(self.cache.prec.diagonal(dim1=-2, dim2=-1).prod(dim=-1))
         )
 
         if self.params.trace_method == TraceMethod.HUTCH_TAYLOR:
@@ -241,7 +245,17 @@ class HMCAdaptiveIter(HMCIter):
 
             penalty = self.params.penalty_func(torch.abs(mu_n))
 
-            loss = loss - self.params.entropy_weight * ltheta + self.params.penalty_weight * penalty
+            entropy = entropy + self.params.entropy_weight * ltheta - self.params.penalty_weight * penalty
+
+            with torch.no_grad():
+                if self.params.trace_method == TraceMethod.HUTCH_TAYLOR:
+                    self.params.penalty_weight = torch.clamp(
+                        self.params.penalty_weight * (
+                            1 + self.params.penalty_weight_adaptive_rate * penalty
+                        ),
+                        min=self.params.penalty_weight_min,
+                        max=self.params.penalty_weight_max,
+                    )
 
         elif self.params.trace_method == TraceMethod.HUTCH_LANCZOS:
             def matvec(v: Tensor) -> Tensor:
@@ -256,26 +270,26 @@ class HMCAdaptiveIter(HMCIter):
                 device=self.params.device,
             )
 
-            # with torch.no_grad():
-            #     def matvec(v: Tensor) -> Tensor:
-            #         return self.DL(mid_traj, v)
+            entropy = entropy + self.params.entropy_weight * ltheta
 
-            #     ltheta_2, _ = taylor_trace_estimator(
-            #         matvec=matvec,
-            #         dimension=mid_traj.shape[-1],
-            #         batch_size=mid_traj.shape[0],
-            #         min_truncation_level=self.params.min_truncation_level,
-            #         dist=self.truncation_dist,
-            #         dist_cdf=self.truncation_dist_cdf,
-            #         spectral_normalization_decay=self.params.spectral_normalization_decay,
-            #         device=self.params.device,
-            #     )
+        return entropy
 
-            # print(ltheta.mean().item(), ltheta_2.mean().item())
+    def _true_entropy_estimator(self, trajectory: List[Dict[str, Tensor]]):
+        noise = trajectory[0]["noise"]
+        logprob_noise = self.params.proposal_dist.log_prob(noise)
 
-            loss = loss - self.params.entropy_weight * ltheta
+        return self.params.entropy_weight * (logprob_noise)
 
-        loss = loss.mean()
+    def _adapt(self, energy_error: Tensor, accept_prob: Tensor, trajectory: List[Dict[str, Tensor]], grad_new: Tensor):
+        loss = -accept_prob
+        entropy = 0
+
+        if self.params.entropy_method == EntropyMethod.LOCGAUS:
+            entropy = self._locgaus_entropy_estimator(trajectory, grad_new)
+        elif self.params.entropy_method == EntropyMethod.FULL:
+            pass
+
+        loss = (loss - entropy).mean()
         # print(f"Loss={loss:.4}")
 
         # TODO: try batch update, i.e. accumulate the gradient and step once every kth iteration
@@ -308,42 +322,27 @@ class HMCAdaptiveIter(HMCIter):
                 max=self.params.entropy_weight_max,
             )
 
-            if self.params.trace_method == TraceMethod.HUTCH_TAYLOR:
-                self.params.penalty_weight = torch.clamp(
-                    self.params.penalty_weight * (
-                        1 + self.params.penalty_weight_adaptive_rate * penalty
-                    ),
-                    min=self.params.penalty_weight_min,
-                    max=self.params.penalty_weight_max,
-                )
-
 
 @dataclass
 class HMCAdaptive(base_sampler.AlgorithmStoppingRule):
     params: HMCAdaptiveParams
+    step_size_burn_in_iter_count: int
     burn_in_iter_count: int
     sample_iter_count: int
     probe_period: int
     stopping_rule: Callable
 
     def load_params(self, params: base_sampler.Params):
-        self.pipeline = base_sampler.Pipeline()
-
-        self.pipeline.append(
+        self.pipeline = base_sampler.Pipeline([
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveIter(params=params),
+                iteration=HMCAdaptiveIter(params=params, adapt_step_size=True),
                 iteration_count=self.burn_in_iter_count,
+                callback=lambda: print(f"step_size={params.lf_step_size}")
             ),
-        )
-
-        collect_iter = HMCAdaptiveIter(params=params)
-        collect_iter.collect_required = True
-
-        self.pipeline.append(
             base_sampler.SampleBlock(
-                iteration=collect_iter,
+                iteration=HMCAdaptiveIter(params=params, collect_required=True),
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
             ),
-        )
+        ])
