@@ -23,7 +23,8 @@ def compute_tv(xs_true, xs_pred, density_probe_count, projection_count=25, key=N
 
 
 def compute_ess(samples, ess_rar=1):
-    return ESS(acl_spectrum(samples[::ess_rar] - samples[::ess_rar].mean(0)[None, ...])).mean()
+    ess = ESS(acl_spectrum(samples[::ess_rar] - samples[::ess_rar].mean(0)[None, ...]))
+    return ess.mean(), ess.std()
 
 
 def compute_emd(samples_true, samples_pred, max_iter_ot=1_000_000):
@@ -54,7 +55,8 @@ def compute_metrics(
     metrics = dict()
     key = jax.random.PRNGKey(0)
 
-    metrics["ess"] = compute_ess(xs_pred, ess_rar)
+    metrics["ess_mean"], metrics["ess_conf_sigma"] = compute_ess(xs_pred, ess_rar)
+    metrics["ess_conf_sigma"] /= xs_pred.shape[1] ** 0.5
 
     xs_pred = xs_pred[-trunc_chain_len:]
 
@@ -68,7 +70,6 @@ def compute_metrics(
     metrics["tv_conf_sigma"] /= xs_pred.shape[1] ** 0.5
 
     # metrics["wasserstein"] = 0
-
     # for b in range(xs_pred.shape[1]):
     #     metrics["wasserstein"] += compute_emd(
     #         xs_true / scale, xs_pred[:, b] / scale, max_iter_ot=max_iter_ot
