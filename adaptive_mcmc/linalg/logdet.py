@@ -40,50 +40,6 @@ def taylor_trace_estimator(matvec, dimension, batch_size, min_truncation_level=2
     return torch.einsum("...i,...i->...", trace, z), cur_vec
 
 
-def lanczos_tridiag(matvec, dimension, batch_size, lanczos_steps,
-                    initial_vector=None,
-                    device="cpu", dtype=torch.float32, eps=1e-9):
-    """
-    mv: (batch_size, n) -> (batch_size, n)
-    """
-    if initial_vector is None:
-        v = torch.randint(0, 2, (batch_size, dimension), device=device, dtype=dtype) * 2 - 1
-    else:
-        v = initial_vector.to(device=device, dtype=dtype)
-
-    lanczos_steps = min(dimension, lanczos_steps)
-
-    v = torch.nn.functional.normalize(v, dim=1)
-    v_prev = torch.zeros_like(v)
-
-    alpha_list = []
-    beta_list = []
-
-    for i in range(lanczos_steps):
-        w = matvec(v)
-
-        if i > 0:
-            w = w - beta_list[-1].unsqueeze(1) * v_prev
-
-        alpha = torch.sum(v * w, dim=1)
-        w = w - alpha.unsqueeze(1) * v
-        beta = torch.norm(w, dim=1)
-
-        alpha_list.append(alpha)
-        beta_list.append(beta)
-
-        if torch.min(beta) < eps:
-            break
-
-        v_next = w / beta.unsqueeze(1)
-        v_prev, v = v, v_next
-
-    alphas = torch.stack(alpha_list, dim=1)
-    betas = torch.stack(beta_list[:-1], dim=1) if len(beta_list) > 1 else None
-
-    return alphas, betas
-
-
 def tridiag_eig_weights(alphas, betas, evals, eps=1e-6):
     """
     Compute w_i = q_i(1)^2 for each eigenpair of a symmetric tridiagonal T,
@@ -137,9 +93,53 @@ def tridiag_eig_weights(alphas, betas, evals, eps=1e-6):
     return weights
 
 
+def lanczos_tridiag(matvec, dimension, batch_size, lanczos_steps,
+                    initial_vector=None,
+                    device="cpu", dtype=torch.float32, eps=1e-9):
+    """
+    mv: (batch_size, n) -> (batch_size, n)
+    """
+    if initial_vector is None:
+        v = torch.randint(0, 2, (batch_size, dimension), device=device, dtype=dtype) * 2 - 1
+    else:
+        v = initial_vector.to(device=device, dtype=dtype)
+
+    lanczos_steps = min(dimension, lanczos_steps)
+
+    v = torch.nn.functional.normalize(v, dim=1)
+    v_prev = torch.zeros_like(v)
+
+    alpha_list = []
+    beta_list = []
+
+    for i in range(lanczos_steps):
+        w = matvec(v)
+
+        if i > 0:
+            w = w - beta_list[-1].unsqueeze(1) * v_prev
+
+        alpha = torch.sum(v * w, dim=1)
+        w = w - alpha.unsqueeze(1) * v
+        beta = torch.norm(w, dim=1)
+
+        alpha_list.append(alpha)
+        beta_list.append(beta)
+
+        if torch.min(beta) < eps:
+            break
+
+        v_next = w / beta.unsqueeze(1)
+        v_prev, v = v, v_next
+
+    alphas = torch.stack(alpha_list, dim=1)
+    betas = torch.stack(beta_list[:-1], dim=1) if len(beta_list) > 1 else None
+
+    return alphas, betas
+
+
 def lanczos_trace_estimator(matvec, dimension, batch_size,
                             probe_vector_count=10, lanczos_steps=10,
-                            device='cpu', dtype=torch.float32):
+                            device='cpu', dtype=torch.float32, jitter=1e-6):
     """
     mv: (batch_size, n) -> (batch_size, n)
     """
@@ -164,8 +164,13 @@ def lanczos_trace_estimator(matvec, dimension, batch_size,
                 + torch.diag_embed(betas, offset=1) \
                 + torch.diag_embed(betas, offset=-1)
 
-        # evals = torch.linalg.eigvalsh(T)
-        evals, evecs = torch.linalg.eigh(T)
+        T = T + torch.eye(T.shape[-1]) * jitter
+        try:
+            # evals = torch.linalg.eigvalsh(T)
+            evals, evecs = torch.linalg.eigh(T)
+        except torch._C._LinAlgError:
+            print(T)
+            exit()
 
         weights = evecs[:, 0, :]**2
         # weights = tridiag_eig_weights(alphas, betas, evals)
