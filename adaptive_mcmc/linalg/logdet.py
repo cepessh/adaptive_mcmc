@@ -174,7 +174,7 @@ def lanczos_trace_estimator(matvec, dimension, batch_size,
 
         weights = evecs[:, 0, :]**2
         # weights = tridiag_eig_weights(alphas, betas, evals)
-        log_evals = torch.log(evals)
+        log_evals = torch.log(torch.abs(evals))
 
         trace = norm_z**2 * torch.sum(weights * log_evals, dim=1)
         sum_trace += trace
