@@ -1,6 +1,6 @@
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Callable, List, Optional, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -14,7 +14,7 @@ from adaptive_mcmc.samplers import base_sampler
 class HMCParams(base_sampler.Params):
     prec: Optional[Tensor] = None
     Minv: Optional[Tensor] = None
-    lf_step_size: float = 1e-2
+    lf_step_size: Union[float, Tensor] = 1e-2
     lf_step_size_adaptive_rate: float = 1e-2
     lf_step_count: int = 5
     target_acceptance: float = 0.65
@@ -81,22 +81,30 @@ class Leapfrog():
                     Minv=Minv, target_dist=target_dist, step_size=step_size,
                     stop_grad=stop_grad, no_grad=no_grad,
                 )
-                if any(torch.isnan(tensor).any().item() for tensor in [ret["q"], ret["p"], ret["gradq"]]):
-                    return None
+
+                with torch.no_grad():
+                    mask = (~torch.isfinite(ret["q"])).any(dim=-1)
+                    mask |= (~torch.isfinite(ret["p"])).any(dim=-1)
+                    mask |= (~torch.isfinite(ret["gradq"])).any(dim=-1)
+
+                    if mask.any():
+                        return None, mask
+
             # happens when NaNs are in ret self.step computation
             except ValueError:
-                return None
+                print("val err")
+                return None, None
 
             trajectory.append(ret)
 
-        return trajectory
+        return trajectory, None
 
 
 @dataclass
 class HMCIter(base_sampler.MHIteration):
     params: HMCParams = field(default_factory=HMCParams)
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
-    adapt_step_size: bool = False
+    adapt_step_size_required: bool = False
 
     def init(self, cache=None):
         super().init(cache=None)
@@ -110,25 +118,19 @@ class HMCIter(base_sampler.MHIteration):
                                          device=self.params.device).repeat(*self.cache.point.shape[:-1], 1, 1)
             self.params.Minv = self.params.prec
 
-    def _run_iter(self, prec: Tensor, Minv: Tensor) -> dict:
+        if isinstance(self.params.lf_step_size, float):
+            self.params.lf_step_size = torch.full((self.cache.point.shape[0], 1), self.params.lf_step_size)
+
+    def _eval_trajectory(self, noise, prec, Minv):
         trajectory = None
+        p = torch.linalg.solve_triangular(
+            torch.einsum("...ij->...ji", prec),
+            noise.unsqueeze(-1),
+            upper=True,
+        ).squeeze(-1)
 
         while trajectory is None:
-            noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
-
-            # nan_prec   = torch.isnan(prec).sum().item()
-            # inf_prec   = torch.isinf(prec).sum().item()
-            # diag_prec  = prec.diagonal(dim1=-2, dim2=-1)
-            # min_diag   = diag_prec.min().item()
-            # print(f"prec NaNs={nan_prec}, Infs={inf_prec}, min(diag)={min_diag:.3e}")
-
-            p = torch.linalg.solve_triangular(
-                torch.einsum("...ij->...ji", prec),
-                noise.unsqueeze(-1),
-                upper=True,
-            ).squeeze(-1)
-
-            trajectory = self.lf_intergrator.run(
+            trajectory, mask = self.lf_intergrator.run(
                 q=self.cache.point,
                 p=p,
                 gradq=self.cache.grad,
@@ -141,14 +143,25 @@ class HMCIter(base_sampler.MHIteration):
             )
 
             if trajectory is None:
-                self.params.lf_step_size *= 1 - self.params.lf_step_size_adaptive_rate
-            else:
-                trajectory[0]["noise"] = noise
+                print("bad traj", mask)
+                with torch.no_grad():
+                    self.params.lf_step_size = self.params.lf_step_size * (
+                        1 - self.params.lf_step_size_adaptive_rate * mask.unsqueeze(-1)
+                    )
 
+        return trajectory[-1]["q"], trajectory
+
+    def _run_iter(self, prec: Tensor, Minv: Tensor, noise_grad: bool = False) -> Dict[str, Tensor]:
         context = torch.no_grad() if self.params.no_grad else nullcontext()
 
+        noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1]).requires_grad_(noise_grad)
+        _, trajectory = self._eval_trajectory(noise, prec, Minv)
+
+        if noise_grad:
+            trajectory[0]["noise"] = noise
+
         with context:
-            self.trajectory = trajectory
+            p = trajectory[0]["p"]
 
             point_new = trajectory[-1]["q"]
             logp_new = self.params.target_dist.log_prob(point_new)
@@ -165,11 +178,11 @@ class HMCIter(base_sampler.MHIteration):
 
             accept_prob = torch.exp(torch.clamp(-energy_error, max=0))
 
-            with torch.no_grad():
-                if self.adapt_step_size:
-                    self.params.lf_step_size *= (
-                        1 + self.params.lf_step_size_adaptive_rate * (accept_prob.mean() - self.params.target_acceptance)
-                    ).item()
+            if self.adapt_step_size_required:
+                with torch.no_grad():
+                    self.params.lf_step_size = self.params.lf_step_size * (
+                        1 + self.params.lf_step_size_adaptive_rate * (accept_prob.unsqueeze(-1) - self.params.target_acceptance)
+                    )
 
             self.MHStep(
                 point_new=point_new,
@@ -206,14 +219,15 @@ class HMCVanilla(base_sampler.AlgorithmStoppingRule):
     def load_params(self, params: base_sampler.Params):
         self.pipeline = base_sampler.Pipeline([
             base_sampler.SampleBlock(
-                iteration=HMCIter(params=params, adapt_step_size=True),
+                iteration=HMCIter(params=params, adapt_step_size_required=True),
                 iteration_count=self.burn_in_iter_count,
-                callback=lambda: print(f"step_size={params.lf_step_size}")
+                callback=lambda: print(f"step_size={params.lf_step_size.mean()}")
             ),
             base_sampler.SampleBlock(
-                iteration=HMCIter(params=params, collect_required=True),
+                iteration=HMCIter(params=params, adapt_step_size_required=True, collect_required=True),
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
+                callback=lambda: print(f"step_size={params.lf_step_size.mean()}")
             ),
         ])

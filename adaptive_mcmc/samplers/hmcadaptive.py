@@ -3,7 +3,6 @@ from enum import Enum
 import math
 from typing import Callable, Dict, List, Optional, Type
 
-import numpy as np
 import torch
 from torch import Tensor
 
@@ -77,7 +76,7 @@ class HMCAdaptiveParams(HMCParams):
 
     penalty_func: Callable = default_penalty_fn
     penalty_weight: float = 1.
-    penalty_weight_min: float = 1.
+    penalty_weight_min: float = 1e-3
     penalty_weight_max: float = 1e5
     penalty_weight_adaptive_rate: float = 1e-2
 
@@ -140,6 +139,9 @@ class HMCAdaptiveIter(HMCIter):
     def init(self, cache: Optional[base_sampler.Cache] = None):
         base_sampler.MHIteration.init(self)
         self.step_id = 0
+
+        if isinstance(self.params.lf_step_size, float):
+            self.params.lf_step_size = torch.full((self.cache.point.shape[0], 1), self.params.lf_step_size)
 
         if self.cache.prec_params is None:
             self.cache.prec_params = CholeskyParametrization(
@@ -208,20 +210,24 @@ class HMCAdaptiveIter(HMCIter):
         self.cache.prec = self.cache.prec_params.make_prec()
         Minv = torch.einsum("...ij,...kj->...ik", self.cache.prec, self.cache.prec)
 
-        ret = self._run_iter(prec=self.cache.prec, Minv=Minv)
+        ret = self._run_iter(
+            prec=self.cache.prec,
+            Minv=Minv,
+            noise_grad=(self.params.entropy_method == EntropyMethod.FULL),
+        )
+
         self._adapt(
             energy_error=ret["energy_error"],
             accept_prob=ret["accept_prob"],
             trajectory=ret["trajectory"],
-            grad_new=ret["grad_new"],
         )
 
-    def _locgaus_entropy_estimator(self, trajectory, grad_new) -> Tensor:
+    def _locgaus_entropy_estimator(self, trajectory) -> Tensor:
         mid_traj = trajectory[len(trajectory) // 2]["q"]
-        dimension = grad_new.shape[-1]
+        dimension = trajectory[0]["q"].shape[-1]
 
         entropy = self.params.entropy_weight * (
-            dimension * np.log(self.params.lf_step_size)
+            dimension * torch.log(self.params.lf_step_size)
             + torch.log(self.cache.prec.diagonal(dim1=-2, dim2=-1).prod(dim=-1))
         )
 
@@ -274,20 +280,38 @@ class HMCAdaptiveIter(HMCIter):
 
         return entropy
 
-    def _true_entropy_estimator(self, trajectory: List[Dict[str, Tensor]]):
+    def _full_entropy_estimator(self, trajectory: List[Dict[str, Tensor]]):
         noise = trajectory[0]["noise"]
         logprob_noise = self.params.proposal_dist.log_prob(noise)
 
-        return self.params.entropy_weight * (logprob_noise)
+        def matvec(v: Tensor) -> Tensor:
+            return torch.autograd.grad(
+                trajectory[-1]["q"],
+                noise,
+                grad_outputs=v,
+                create_graph=True,
+                retain_graph=True,
+            )[0]
 
-    def _adapt(self, energy_error: Tensor, accept_prob: Tensor, trajectory: List[Dict[str, Tensor]], grad_new: Tensor):
+        logdetT = lanczos_trace_estimator(
+            matvec=matvec,
+            dimension=noise.shape[-1],
+            batch_size=noise.shape[0],
+            probe_vector_count=self.params.krylov_probe_vectors,
+            lanczos_steps=self.params.lanczos_steps,
+            device=self.params.device,
+        )
+
+        return -self.params.entropy_weight * (logprob_noise - logdetT)
+
+    def _adapt(self, energy_error: Tensor, accept_prob: Tensor, trajectory: List[Dict[str, Tensor]]):
         loss = -accept_prob
         entropy = 0
 
         if self.params.entropy_method == EntropyMethod.LOCGAUS:
-            entropy = self._locgaus_entropy_estimator(trajectory, grad_new)
+            entropy = self._locgaus_entropy_estimator(trajectory)
         elif self.params.entropy_method == EntropyMethod.FULL:
-            pass
+            entropy = self._full_entropy_estimator(trajectory)
 
         loss = (loss - entropy).mean()
         # print(f"Loss={loss:.4}")
@@ -335,14 +359,15 @@ class HMCAdaptive(base_sampler.AlgorithmStoppingRule):
     def load_params(self, params: base_sampler.Params):
         self.pipeline = base_sampler.Pipeline([
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveIter(params=params, adapt_step_size=True),
+                iteration=HMCAdaptiveIter(params=params, adapt_step_size_required=True),
                 iteration_count=self.burn_in_iter_count,
-                callback=lambda: print(f"step_size={params.lf_step_size}")
+                callback=lambda: print(f"step_size={params.lf_step_size.mean()}")
             ),
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveIter(params=params, collect_required=True),
+                iteration=HMCAdaptiveIter(params=params, adapt_step_size_required=True, collect_required=True),
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
+                callback=lambda: print(f"step_size={params.lf_step_size.mean()}")
             ),
         ])
