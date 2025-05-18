@@ -14,26 +14,30 @@ from adaptive_mcmc.distributions.distribution import Distribution
 
 
 @dataclass
-class Params(ABC):
+class CommonParams(ABC):
     target_dist: Optional[Union[torchDist, Distribution]] = None
     starting_point: Optional[Tensor] = None
     proposal_dist: Optional[Union[torchDist, Distribution]] = None
-    device: str = "cpu"
 
-    def copy(self) -> "Params":
+    def copy(self) -> "CommonParams":
         return deepcopy(self)
 
-    def update(self, new_params: "Params") -> None:
+    def update(self, new_params: "CommonParams") -> None:
         for field_name in new_params.__dict__:
             new_value = getattr(new_params, field_name)
             if new_value is not None:
                 setattr(self, field_name, new_value)
 
-    def copy_update(self, new_params: "Params") -> None:
+    def copy_update(self, new_params: "CommonParams") -> None:
         updated = self.copy()
         updated.update(new_params)
 
         return updated
+
+
+@dataclass
+class FixedParams(ABC):
+    device: str = "cpu"
 
 
 @dataclass
@@ -50,7 +54,7 @@ class Cache:
     accept_prob_hist: list[float] = field(default_factory=list[float])
 
 
-def update_params(params: Params, cache: Cache, new_params: Params) -> None:
+def update_params(params: CommonParams, cache: Cache, new_params: CommonParams) -> None:
     if new_params is not None:
         params.update(new_params)
 
@@ -61,18 +65,20 @@ def update_params(params: Params, cache: Cache, new_params: Params) -> None:
 @dataclass
 class Iteration(ABC):
     cache: Cache = field(default_factory=Cache)
-    params: Params = field(default_factory=Params)
+    common_params: CommonParams = field(default_factory=CommonParams)
+    fixed_params: FixedParams = field(default_factory=FixedParams)
     collect_required: bool = False
     index: int = 0
 
     def init(self, cache=None) -> None:
-        self.cache.point = self.params.starting_point.clone().requires_grad_()
-        self.cache.logp = self.params.target_dist.log_prob(self.cache.point)
+        self.cache.point = self.common_params.starting_point.clone().requires_grad_()
+        self.cache.logp = self.common_params.target_dist.log_prob(self.cache.point)
         self.cache.grad = torch.autograd.grad(
             self.cache.logp.sum(),
             self.cache.point,
-            retain_graph=True,
-        )[0].detach().requires_grad_()
+            retain_graph=False,
+        )[0].detach()
+        self.cache.point = self.cache.point.detach()
 
     @abstractmethod
     def run(self) -> Cache:
@@ -88,7 +94,7 @@ class Iteration(ABC):
 class MHIteration(Iteration):
     def MHStep(self, point_new: Tensor, logp_new: Tensor, grad_new: Tensor, accept_prob: Tensor) -> None:
         with torch.no_grad():
-            mask = torch.rand_like(accept_prob, device=self.params.device) < accept_prob
+            mask = torch.rand_like(accept_prob, device=self.fixed_params.device) < accept_prob
 
             self.cache.point[mask] = point_new[mask]
             self.cache.logp[mask] = logp_new[mask]
@@ -96,9 +102,9 @@ class MHIteration(Iteration):
 
             self.cache.accept_prob_hist.append(accept_prob.mean().item())
 
-        self.cache.point = self.cache.point.detach().requires_grad_(self.cache.point.requires_grad)
-        self.cache.logp = self.cache.logp.detach().requires_grad_(self.cache.logp.requires_grad)
-        self.cache.grad = self.cache.grad.detach().requires_grad_(self.cache.grad.requires_grad)
+        self.cache.point = self.cache.point.detach()    # .requires_grad_(self.cache.point.requires_grad)
+        self.cache.logp = self.cache.logp.detach()  # .requires_grad_(self.cache.logp.requires_grad)
+        self.cache.grad = self.cache.grad.detach()  # .requires_grad_(self.cache.grad.requires_grad)
 
 
 def track_runtime(func):
@@ -128,8 +134,9 @@ class SampleBlock:
     pure_runtime: float = 0.
     callback: Optional[Callable] = None
 
-    def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None, progress: bool = True) -> Tuple[Cache, Params]:
-        update_params(self.iteration.params, cache, params)
+    def run(self, cache: Optional[Cache] = None, common_params: Optional[CommonParams] = None,
+            progress: bool = True) -> Tuple[Cache, CommonParams]:
+        update_params(self.iteration.common_params, cache, common_params)
 
         if cache is not None:
             if isinstance(cache, type(self.iteration.cache)):
@@ -155,7 +162,7 @@ class SampleBlock:
                 if stop_status.is_stop:
                     break
 
-        return self.iteration.cache, self.iteration.params
+        return self.iteration.cache, self.iteration.common_params
 
 
 @dataclass
@@ -168,13 +175,13 @@ class Pipeline:
         self.sample_blocks.append(block)
 
     @track_runtime
-    def run(self, cache: Optional[Cache] = None, params: Optional[Params] = None) -> None:
+    def run(self, cache: Optional[Cache] = None, params: Optional[CommonParams] = None) -> None:
         print("number of blocks:", len(self.sample_blocks))
 
         sample_count = 0
         for block in self.sample_blocks:
-            shape = block.iteration.params.starting_point.shape
-            device = block.iteration.params.device
+            shape = block.iteration.common_params.starting_point.shape
+            device = block.iteration.fixed_params.device
             if block.iteration.collect_required:
                 block.iteration.index = sample_count
                 sample_count += block.iteration_count
@@ -201,7 +208,7 @@ class Algorithm(ABC):
     name: str
 
     @abstractmethod
-    def load_params(self, params: Params):
+    def load_params(self, common_params: CommonParams):
         pass
 
     def run(self):

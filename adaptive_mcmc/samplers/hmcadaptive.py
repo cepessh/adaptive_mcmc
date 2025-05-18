@@ -1,14 +1,15 @@
 from dataclasses import dataclass, field
 from enum import Enum
 import math
-from typing import Callable, Dict, List, Optional, Type
+from typing import Callable, Dict, List, Optional, Tuple, Type
 
 import torch
 from torch import Tensor
 
 from adaptive_mcmc.samplers import base_sampler
-from adaptive_mcmc.samplers.hmc import HMCParams, HMCIter, Leapfrog
+from adaptive_mcmc.samplers.hmc import HMCCommonParams, HMCFixedParams, HMCIter, Leapfrog, PrecType
 from adaptive_mcmc.linalg.logdet import lanczos_trace_estimator, taylor_trace_estimator
+# from adaptive_mcmc.tools.computational_graph import print_graph_with_tensors, count_graph_nodes
 
 
 class TraceMethod(str, Enum):
@@ -20,6 +21,11 @@ class EntropyMethod(str, Enum):
     NONE = "none"
     FULL = "full"
     LOCGAUS = "locgaus"
+
+
+class BackpropMethod(str, Enum):
+    FULL = "full"
+    APPROX = "approx"
 
 
 def default_penalty_fn(x: Tensor) -> Tensor:
@@ -56,10 +62,7 @@ class WarmupCosineAnnealingScheduler(torch.optim.lr_scheduler._LRScheduler):
 
 
 @dataclass
-class HMCAdaptiveParams(HMCParams):
-    trace_method: TraceMethod = TraceMethod.HUTCH_TAYLOR
-    entropy_method: EntropyMethod = EntropyMethod.LOCGAUS
-
+class HMCAdaptiveCommonParams(HMCCommonParams):
     truncation_level_prob: float = 0.5
     min_truncation_level: int = 2
     spectral_normalization_decay: float = 0.99
@@ -74,52 +77,82 @@ class HMCAdaptiveParams(HMCParams):
     entropy_weight_max: float = 1e2
     entropy_weight_adaptive_rate: float = 1e-2
 
-    penalty_func: Callable = default_penalty_fn
     penalty_weight: float = 1.
     penalty_weight_min: float = 1e-3
     penalty_weight_max: float = 1e5
     penalty_weight_adaptive_rate: float = 1e-2
 
-    stop_grad: bool = False
     clip_grad_value: float = 1e3
 
-    optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam
-    scheduler_cls: Optional[Type[WarmupCosineAnnealingScheduler]] = None
 
+@dataclass
+class HMCAdaptiveFixedParams(HMCFixedParams):
     iter_count: Optional[int] = None
     warm_up_ratio: float = 0.05
 
     prec_init_scale: float = 1e-2
 
-    def __post_init__(self):
-        self.no_grad = False
+    no_grad: bool = False
+    stop_grad: bool = False
+
+    optimizer_cls: Type[torch.optim.Optimizer] = torch.optim.Adam
+    scheduler_cls: Optional[Type[WarmupCosineAnnealingScheduler]] = None
+
+    trace_method: TraceMethod = TraceMethod.HUTCH_TAYLOR
+    entropy_method: EntropyMethod = EntropyMethod.LOCGAUS
+    backprop_method: BackpropMethod = BackpropMethod.FULL
+    prec_type: PrecType = PrecType.Dense
+
+    penalty_func: Callable = default_penalty_fn
 
 
 @dataclass
 class CholeskyParametrization:
-    def __init__(self, batch_size, dimension, device, scale=1e-2):
+    def __init__(self, batch_size, dimension, device, prec_type, scale=1e-2):
         self.batch_size = batch_size
         self.dimension = dimension
         self.device = device
-        self.params = scale * torch.randn(batch_size * dimension * (dimension + 1) // 2, device=device)
-        self.params = self.params.requires_grad_()
+        self.prec_type = prec_type
+
+        if prec_type == PrecType.Dense:
+            params_count = dimension * (dimension + 1) // 2
+        elif prec_type == PrecType.TRIDIAG:
+            params_count = 2 * dimension - 1
+
+        self.params = (
+            scale * torch.randn(batch_size * params_count, device=device)
+        ).requires_grad_()
 
     def make_prec(self) -> Tensor:
-        self.prec = torch.zeros(self.batch_size, self.dimension, self.dimension, device=self.device)
+        b, d, dev = self.batch_size, self.dimension, self.device
 
-        tril_ind = torch.tril_indices(row=self.dimension, col=self.dimension)
-        for i in range(self.batch_size):
-            start_idx = i * self.dimension * (self.dimension + 1) // 2
-            end_idx = start_idx + self.dimension * (self.dimension + 1) // 2
-            raw_params = self.params[start_idx:end_idx]
+        if self.prec_type == PrecType.Dense:
+            n = d * (d + 1) // 2
+            raw = self.params.view(b, n)
 
-            L = torch.zeros(self.dimension, self.dimension, device=self.device)
-            L[tril_ind[0], tril_ind[1]] = raw_params
-            diag_ind = torch.arange(self.dimension)
-            L[diag_ind, diag_ind] = torch.exp(L[diag_ind, diag_ind])
-            self.prec[i] = L
+            L = torch.zeros(b, d, d, device=dev)
 
-        return self.prec
+            tri_i, tri_j = torch.tril_indices(d, d, device=dev)
+            L[:, tri_i, tri_j] = raw
+
+            diag = torch.arange(d, device=dev)
+            L[:, diag, diag] = torch.exp(L[:, diag, diag])
+
+        elif self.prec_type == PrecType.TRIDIAG:
+            n = 2 * d - 1
+            raw = self.params.view(b, n)
+
+            main = raw[:, :d]       # (batch, d)
+            lower = raw[:, d:]      # (batch, d-1)
+
+            L = torch.zeros(b, d, d, device=dev)
+
+            diag = torch.arange(d, device=dev)
+            L[:, diag, diag] = torch.exp(main)
+            L[:, diag[1:], diag[:-1]] = lower
+
+        self.prec = L
+        return L
 
 
 @dataclass
@@ -133,22 +166,27 @@ class AdaptiveCache(base_sampler.Cache):
 @dataclass
 class HMCAdaptiveIter(HMCIter):
     cache: AdaptiveCache = field(default_factory=AdaptiveCache)
-    params: HMCAdaptiveParams = field(default_factory=HMCAdaptiveParams)
+    common_params: HMCAdaptiveCommonParams = field(default_factory=HMCAdaptiveCommonParams)
+    fixed_params: HMCAdaptiveFixedParams = field(default_factory=HMCAdaptiveFixedParams)
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
 
     def init(self, cache: Optional[base_sampler.Cache] = None):
         base_sampler.MHIteration.init(self)
         self.step_id = 0
 
-        if isinstance(self.params.lf_step_size, float):
-            self.params.lf_step_size = torch.full((self.cache.point.shape[0], 1), self.params.lf_step_size)
+        if isinstance(self.common_params.lf_step_size, float):
+            self.common_params.lf_step_size = torch.full(
+                (self.cache.point.shape[0], 1),
+                self.common_params.lf_step_size,
+            )
 
         if self.cache.prec_params is None:
             self.cache.prec_params = CholeskyParametrization(
                 batch_size=self.cache.point.shape[0],
                 dimension=self.cache.point.shape[-1],
-                device=self.params.device,
-                scale=self.params.prec_init_scale,
+                device=self.fixed_params.device,
+                scale=self.fixed_params.prec_init_scale,
+                prec_type=self.fixed_params.prec_type,
             )
 
         def ensure_tensor(param, shape):
@@ -159,130 +197,143 @@ class HMCAdaptiveIter(HMCIter):
                     param = param.unsqueeze(-1)
             return param
 
-        self.params.entropy_weight = ensure_tensor(self.params.entropy_weight, self.cache.point.shape[:-1])
-        self.params.penalty_weight = ensure_tensor(self.params.penalty_weight, self.cache.point.shape[:-1])
+        self.common_params.entropy_weight = ensure_tensor(self.common_params.entropy_weight, self.cache.point.shape[:-1])
+        self.common_params.penalty_weight = ensure_tensor(self.common_params.penalty_weight, self.cache.point.shape[:-1])
 
         if self.cache.optimizer is None:
-            self.cache.optimizer = self.params.optimizer_cls(
+            self.cache.optimizer = self.fixed_params.optimizer_cls(
                 [self.cache.prec_params.params],
-                lr=self.params.learning_rate
+                lr=self.common_params.learning_rate
             )
 
-        if self.cache.scheduler is None and self.params.scheduler_cls is not None:
-            self.cache.scheduler = self.params.scheduler_cls(
+        if self.cache.scheduler is None and self.fixed_params.scheduler_cls is not None:
+            self.cache.scheduler = self.fixed_params.scheduler_cls(
                 self.cache.optimizer,
-                warmup_epochs=int(self.params.warm_up_ratio * self.params.iter_count),
-                total_epochs=self.params.iter_count,
+                warmup_epochs=int(self.fixed_params.warm_up_ratio * self.fixed_params.iter_count),
+                total_epochs=self.fixed_params.iter_count,
             )
+
+        build_graph = self.fixed_params.backprop_method == BackpropMethod.FULL
 
         def grad_logp(v: Tensor) -> Tensor:
             return torch.autograd.grad(
-                self.params.target_dist.log_prob(v).sum(),
+                self.common_params.target_dist.log_prob(v).sum(),
                 v,
-                retain_graph=True,
-                create_graph=True
+                retain_graph=build_graph,
+                create_graph=build_graph,
             )[0]
 
         def DL(x: Tensor, v: Tensor) -> Tensor:
             z = torch.autograd.functional.jvp(
                 grad_logp,
                 x,
-                torch.bmm(self.cache.prec, v.unsqueeze(-1)).squeeze(-1),
-                create_graph=True,
+                self.matvec_c(v),
+                # torch.bmm(self.cache.prec, v.unsqueeze(-1)).squeeze(-1),
+                create_graph=build_graph,
             )[1]
             return (
-                -self.params.lf_step_size ** 2 * (self.params.lf_step_count ** 2 - 1) / 6
-                * torch.einsum("...ij,...i->...j", self.cache.prec, z)
-            ).requires_grad_()
+                -self.common_params.lf_step_size ** 2 * (self.common_params.lf_step_count ** 2 - 1) / 6
+                * self.matvec_ct(z)
+                # * torch.einsum("...ij,...i->...j", self.cache.prec, z)
+            )
 
         self.DL = DL
+        self.grad_logp = grad_logp
 
         def dist_cdf(k):
-            if k <= self.params.min_truncation_level:
+            if k <= self.common_params.min_truncation_level:
                 return 0
-            return 1 - (1 - self.params.truncation_level_prob) ** (k - self.params.min_truncation_level)
+            return 1 - (1 - self.common_params.truncation_level_prob) ** (k - self.common_params.min_truncation_level)
 
         self.truncation_dist_cdf = dist_cdf
-        self.truncation_dist = torch.distributions.Geometric(self.params.truncation_level_prob)
-        self.cache.prec = self.cache.prec_params.make_prec()
+        self.truncation_dist = torch.distributions.Geometric(self.common_params.truncation_level_prob)
 
     def run(self):
-        self.cache.prec = self.cache.prec_params.make_prec()
-        Minv = torch.einsum("...ij,...kj->...ik", self.cache.prec, self.cache.prec)
+        if self.fixed_params.prec_type == PrecType.Dense:
+            self.cache.prec = self.cache.prec_params.make_prec()
+            self.make_matvecs(self.cache.prec)
+            prec = self.cache.prec
+        elif self.fixed_params.prec_type == PrecType.TRIDIAG:
+            b, d = self.cache.point.shape
+            prec = self.cache.prec_params.params.view(b, 2 * d - 1)
+            self.make_matvecs(prec, dimension=d)
 
         ret = self._run_iter(
-            prec=self.cache.prec,
-            Minv=Minv,
-            noise_grad=(self.params.entropy_method == EntropyMethod.FULL),
+            prec=prec,
+            noise_grad=(self.fixed_params.entropy_method == EntropyMethod.FULL),
         )
 
         self._adapt(
+            prec=prec,
             energy_error=ret["energy_error"],
             accept_prob=ret["accept_prob"],
             trajectory=ret["trajectory"],
         )
 
-    def _locgaus_entropy_estimator(self, trajectory) -> Tensor:
+    def _locgaus_entropy_estimator(self, prec, trajectory) -> Tensor:
         mid_traj = trajectory[len(trajectory) // 2]["q"]
         dimension = trajectory[0]["q"].shape[-1]
 
-        entropy = self.params.entropy_weight * (
-            dimension * torch.log(self.params.lf_step_size)
-            + torch.log(self.cache.prec.diagonal(dim1=-2, dim2=-1).prod(dim=-1))
-        )
+        log_diag_sum = 0.
+        if self.fixed_params.prec_type == PrecType.Dense:
+            log_diag_sum = torch.log(prec.diagonal(dim1=-2, dim2=-1)).sum(dim=-1)
+        elif self.fixed_params.prec_type == PrecType.TRIDIAG:
+            log_diag_sum = prec[:, :dimension].sum(dim=-1)
 
-        if self.params.trace_method == TraceMethod.HUTCH_TAYLOR:
+        entropy = self.common_params.entropy_weight * log_diag_sum
+
+        if self.fixed_params.trace_method == TraceMethod.HUTCH_TAYLOR:
             def matvec(v: Tensor) -> Tensor:
                 return self.DL(mid_traj, v)
 
             ltheta, eta = taylor_trace_estimator(
                 matvec=matvec,
-                dimension=mid_traj.shape[-1],
+                dimension=dimension,
                 batch_size=mid_traj.shape[0],
-                min_truncation_level=self.params.min_truncation_level,
+                min_truncation_level=self.common_params.min_truncation_level,
                 dist=self.truncation_dist,
                 dist_cdf=self.truncation_dist_cdf,
-                spectral_normalization_decay=self.params.spectral_normalization_decay,
-                device=self.params.device,
+                spectral_normalization_decay=self.common_params.spectral_normalization_decay,
+                device=self.fixed_params.device,
             )
 
             b_n = eta / torch.norm(eta, p=2, dim=-1, keepdim=True)
             mu_n = torch.einsum("...i,...i->...", b_n, self.DL(mid_traj, b_n)).unsqueeze(-1)
 
-            penalty = self.params.penalty_func(torch.abs(mu_n))
+            penalty = self.fixed_params.penalty_func(torch.abs(mu_n))
 
-            entropy = entropy + self.params.entropy_weight * ltheta - self.params.penalty_weight * penalty
+            entropy = entropy + self.common_params.entropy_weight * ltheta - self.common_params.penalty_weight * penalty
 
             with torch.no_grad():
-                if self.params.trace_method == TraceMethod.HUTCH_TAYLOR:
-                    self.params.penalty_weight = torch.clamp(
-                        self.params.penalty_weight * (
-                            1 + self.params.penalty_weight_adaptive_rate * penalty
+                if self.fixed_params.trace_method == TraceMethod.HUTCH_TAYLOR:
+                    self.common_params.penalty_weight = torch.clamp(
+                        self.common_params.penalty_weight * (
+                            1 + self.common_params.penalty_weight_adaptive_rate * penalty
                         ),
-                        min=self.params.penalty_weight_min,
-                        max=self.params.penalty_weight_max,
+                        min=self.common_params.penalty_weight_min,
+                        max=self.common_params.penalty_weight_max,
                     )
 
-        elif self.params.trace_method == TraceMethod.HUTCH_LANCZOS:
+        elif self.fixed_params.trace_method == TraceMethod.HUTCH_LANCZOS:
             def matvec(v: Tensor) -> Tensor:
                 return v + self.DL(mid_traj, v)
 
             ltheta = lanczos_trace_estimator(
                 matvec=matvec,
-                dimension=mid_traj.shape[-1],
+                dimension=dimension,
                 batch_size=mid_traj.shape[0],
-                probe_vector_count=self.params.krylov_probe_vectors,
-                lanczos_steps=self.params.lanczos_steps,
-                device=self.params.device,
+                probe_vector_count=self.common_params.krylov_probe_vectors,
+                lanczos_steps=self.common_params.lanczos_steps,
+                device=self.common_params.device,
             )
 
-            entropy = entropy + self.params.entropy_weight * ltheta
+            entropy = entropy + self.common_params.entropy_weight * ltheta
 
         return entropy
 
     def _full_entropy_estimator(self, trajectory: List[Dict[str, Tensor]]):
         noise = trajectory[0]["noise"]
-        logprob_noise = self.params.proposal_dist.log_prob(noise)
+        logprob_noise = self.common_params.proposal_dist.log_prob(noise)
 
         def matvec(v: Tensor) -> Tensor:
             return torch.autograd.grad(
@@ -297,31 +348,89 @@ class HMCAdaptiveIter(HMCIter):
             matvec=matvec,
             dimension=noise.shape[-1],
             batch_size=noise.shape[0],
-            probe_vector_count=self.params.krylov_probe_vectors,
-            lanczos_steps=self.params.lanczos_steps,
-            device=self.params.device,
+            probe_vector_count=self.common_params.krylov_probe_vectors,
+            lanczos_steps=self.common_params.lanczos_steps,
+            device=self.common_params.device,
         )
 
-        return -self.params.entropy_weight * (logprob_noise - logdetT)
+        return -self.common_params.entropy_weight * (logprob_noise - logdetT)
 
-    def _adapt(self, energy_error: Tensor, accept_prob: Tensor, trajectory: List[Dict[str, Tensor]]):
-        loss = -accept_prob
+    def _point_potential_grad(self, q: Tensor) -> Tensor:
+        q = q.detach().requires_grad_(True)
+        neg_pot = self.grad_logp(q).detach()
+        q = q.requires_grad_(False)
+
+        return -neg_pot
+
+    def _trajectory_potential_grad(self, trajectory: List[Dict[str, Tensor]]) -> Tuple[Tensor, Tensor]:
+        potential = torch.zeros_like(trajectory[0]["q"], device=self.fixed_params.device)
+        weighed_potential = torch.zeros_like(trajectory[0]["q"], device=self.fixed_params.device)
+
+        L = len(trajectory)
+        for i, entry in enumerate(trajectory[:-1]):
+            cur_pot = self._point_potential_grad(entry["q"])
+            with torch.no_grad():
+                potential = potential + cur_pot
+                weighed_potential = weighed_potential + (L - i - 1) * cur_pot
+
+        return potential, weighed_potential
+
+    def _energy_error(
+        self,
+        trajectory: List[Dict[str, Tensor]],
+        traj_pot: Tensor,
+        weighted_traj_pot: Tensor
+    ) -> Tensor:
+        L = len(trajectory)
+        h = self.common_params.lf_step_size
+        v = trajectory[0]["noise"]
+
+        with torch.no_grad():
+            q0 = trajectory[0]["q"]
+            q0_pot = -self.common_params.proposal_dist.log_prob(q0)
+            q0_kin = 0.5 * v.pow(2).sum(dim=-1)
+
+        q0_pot_grad = self._point_potential_grad(q0)
+
+        qL = (
+            q0 + L * h * self.matvec_c(v) - h.pow(2) * self.matvec_minv(weighted_traj_pot)
+            - 0.5 * L * h.pow(2) * self.matvec_minv(q0_pot_grad)
+        )
+        qL_pot = -self.common_params.proposal_dist.log_prob(qL)
+
+        qL_pot_grad = self._point_potential_grad(qL)
+        vL = v - 0.5 * h * self.matvec_c(q0_pot_grad + qL_pot_grad) - h * self.matvec_c(traj_pot)
+        qL_kin = 0.5 * vL.pow(2).sum(dim=-1)
+
+        return qL_pot + qL_kin - q0_pot - q0_kin
+
+    def _adapt(self, prec: Tensor, energy_error: Tensor, accept_prob: Tensor, trajectory: List[Dict[str, Tensor]]) -> None:
+        if self.fixed_params.backprop_method == BackpropMethod.APPROX:
+            traj_pot, weighted_traj_pot = self._trajectory_potential_grad(trajectory)
+            energy_error = self._energy_error(trajectory, traj_pot, weighted_traj_pot)
+
+        loss = -torch.clamp(-energy_error, max=0)
+
         entropy = 0
 
-        if self.params.entropy_method == EntropyMethod.LOCGAUS:
-            entropy = self._locgaus_entropy_estimator(trajectory)
-        elif self.params.entropy_method == EntropyMethod.FULL:
+        if self.fixed_params.entropy_method == EntropyMethod.LOCGAUS:
+            entropy = self._locgaus_entropy_estimator(
+                prec=prec,
+                trajectory=trajectory,
+            )
+        elif self.fixed_params.entropy_method == EntropyMethod.FULL:
             entropy = self._full_entropy_estimator(trajectory)
 
         loss = (loss - entropy).mean()
+        # print(count_graph_nodes(loss))
+        # print_graph_with_tensors(loss)
         # print(f"Loss={loss:.4}")
 
-        # TODO: try batch update, i.e. accumulate the gradient and step once every kth iteration
         self.cache.optimizer.zero_grad()
 
         # torch.autograd.set_detect_anomaly(True)
 
-        loss.backward()
+        loss.backward(retain_graph=False)
 
         for p in self.cache.optimizer.param_groups[0]["params"]:
             if p.grad is None:
@@ -330,7 +439,7 @@ class HMCAdaptiveIter(HMCIter):
 
         torch.nn.utils.clip_grad_value_(
             self.cache.optimizer.param_groups[0]["params"],
-            clip_value=self.params.clip_grad_value,
+            clip_value=self.common_params.clip_grad_value,
         )
 
         self.cache.optimizer.step()
@@ -338,36 +447,48 @@ class HMCAdaptiveIter(HMCIter):
             self.cache.scheduler.step()
 
         with torch.no_grad():
-            self.params.entropy_weight = torch.clamp(
-                self.params.entropy_weight * (
-                    1 + self.params.entropy_weight_adaptive_rate * (accept_prob.unsqueeze(-1) - self.params.target_acceptance)
+            self.common_params.entropy_weight = torch.clamp(
+                self.common_params.entropy_weight * (
+                    1 + self.common_params.entropy_weight_adaptive_rate * (
+                        accept_prob.unsqueeze(-1) - self.fixed_params.target_acceptance
+                    )
                 ),
-                min=self.params.entropy_weight_min,
-                max=self.params.entropy_weight_max,
+                min=self.common_params.entropy_weight_min,
+                max=self.common_params.entropy_weight_max,
             )
 
 
 @dataclass
 class HMCAdaptive(base_sampler.AlgorithmStoppingRule):
-    params: HMCAdaptiveParams
     step_size_burn_in_iter_count: int
     burn_in_iter_count: int
     sample_iter_count: int
     probe_period: int
     stopping_rule: Callable
+    common_params: HMCAdaptiveCommonParams = field(default_factory=HMCAdaptiveCommonParams)
+    fixed_params: HMCAdaptiveFixedParams = field(default_factory=HMCAdaptiveFixedParams)
 
-    def load_params(self, params: base_sampler.Params):
+    def load_params(self, common_params: base_sampler.CommonParams):
         self.pipeline = base_sampler.Pipeline([
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveIter(params=params, adapt_step_size_required=True),
+                iteration=HMCAdaptiveIter(
+                    common_params=common_params,
+                    fixed_params=self.fixed_params,
+                    adapt_step_size_required=True
+                ),
                 iteration_count=self.burn_in_iter_count,
-                callback=lambda: print(f"step_size={params.lf_step_size.mean()}")
+                callback=lambda: print(f"step_size={common_params.lf_step_size.mean()}")
             ),
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveIter(params=params, adapt_step_size_required=True, collect_required=True),
+                iteration=HMCAdaptiveIter(
+                    common_params=common_params,
+                    fixed_params=self.fixed_params,
+                    adapt_step_size_required=True,
+                    collect_required=True
+                ),
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
-                callback=lambda: print(f"step_size={params.lf_step_size.mean()}")
+                callback=lambda: print(f"step_size={common_params.lf_step_size.mean()}")
             ),
         ])

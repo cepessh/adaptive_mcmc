@@ -33,7 +33,6 @@ def taylor_trace_estimator(matvec, dimension, batch_size, min_truncation_level=2
         ).unsqueeze(-1)
 
         cur_vec = spectral_normalization * cur_res
-        # cur_vec = cur_res
         trace += sign / ((1 - dist_cdf(i - 1)) * i) * cur_vec
         sign *= -1
 
