@@ -51,8 +51,8 @@ class GaussianMixture(SamplableDistribution):
         self.covs = covs.to(dtype=torch.float32)
         self.sample_batch_size = sample_batch_size
 
-        self.category = torch.distributions.Categorical(self.weights)
-        self.gaussians = torch.distributions.MultivariateNormal(
+        self.category = Categorical(self.weights)
+        self.gaussians = MultivariateNormal(
             loc=self.means,
             covariance_matrix=self.covs
         )
@@ -150,3 +150,47 @@ class FunnelDistribution(SamplableDistribution):
         ret += 0.5 * torch.square(first_dim) / (2 * self.scale)
 
         return -ret
+
+
+class BananaDistribution(SamplableDistribution):
+    """
+    A 2‑dimensional “banana” (twisted Gaussian) distribution.
+    Only the first two components are coupled; higher dims (if any) stay standard normal.
+    """
+
+    def __init__(self, dimension: int = 2, b: float = 1.0):
+        """
+        Args:
+            dimension (int): Total dimension (must be ≥2).
+            b (float):  Nonlinearity (banana‑bend) parameter.
+        """
+        assert dimension >= 2, "BananaDistribution requires dimension ≥ 2"
+        self.dimension = dimension
+        self.b = b
+        # scalar Normal(0,1) for all coords
+        self.base = Normal(0.0, 1.0)
+
+    def sample(self, sample_count: int) -> Tensor:
+        """
+        Draws samples by:
+          1. u ∼ N(0, I)
+          2. z₀ = u₀
+          3. z₁ = u₁ + b * (u₀² − 1)
+          4. z₂… = u₂…
+        """
+        u = self.base.sample((sample_count, self.dimension))
+        z = u.clone()
+        z[:, 1] = u[:, 1] + self.b * (u[:, 0].pow(2) - 1.0)
+        return z
+
+    def log_prob(self, z: Tensor) -> Tensor:
+        """
+        Inverts the twist:
+          u₀ = z₀
+          u₁ = z₁ - b * (z₀² − 1)
+          u₂… = z₂…
+        then returns ∑ log N(uᵢ;0,1).  Jacobian is 1.
+        """
+        u = z.clone()
+        u[..., 1] = z[..., 1] - self.b * (z[..., 0].pow(2) - 1.0)
+        return self.base.log_prob(u).sum(dim=-1)
