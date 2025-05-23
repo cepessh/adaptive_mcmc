@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 import math
 from typing import Callable, Dict, List, Optional, Tuple, Type
@@ -7,7 +7,9 @@ import torch
 from torch import Tensor
 
 from adaptive_mcmc.samplers import base_sampler
-from adaptive_mcmc.samplers.hmc import HMCCommonParams, HMCFixedParams, HMCIter, Leapfrog, PrecType
+from adaptive_mcmc.samplers.hmc import (
+    HMCCommonParams, HMCFixedParams, HMCIter, Leapfrog, PrecType, HMCCache, HMCVanilla
+)
 from adaptive_mcmc.linalg.logdet import lanczos_trace_estimator, taylor_trace_estimator
 # from adaptive_mcmc.tools.computational_graph import print_graph_with_tensors, count_graph_nodes
 
@@ -120,15 +122,14 @@ class CholeskyParametrization:
             params_count = 2 * dimension - 1
 
         self.params = (
-            scale * torch.randn(batch_size * params_count, device=device)
+            scale * torch.randn(batch_size, params_count, device=device)
         ).requires_grad_()
 
     def make_prec(self) -> Tensor:
         b, d, dev = self.batch_size, self.dimension, self.device
 
         if self.prec_type == PrecType.Dense:
-            n = d * (d + 1) // 2
-            raw = self.params.view(b, n)
+            raw = self.params
 
             L = torch.zeros(b, d, d, device=dev)
 
@@ -139,8 +140,7 @@ class CholeskyParametrization:
             L[:, diag, diag] = torch.exp(L[:, diag, diag])
 
         elif self.prec_type == PrecType.TRIDIAG:
-            n = 2 * d - 1
-            raw = self.params.view(b, n)
+            raw = self.params
 
             main = raw[:, :d]       # (batch, d)
             lower = raw[:, d:]      # (batch, d-1)
@@ -156,11 +156,12 @@ class CholeskyParametrization:
 
 
 @dataclass
-class AdaptiveCache(base_sampler.Cache):
+class AdaptiveCache(HMCCache):
     prec_params: Optional[CholeskyParametrization] = None
     optimizer: Optional[torch.optim.Optimizer] = None
     scheduler: Optional[torch.torch.optim.lr_scheduler._LRScheduler] = None
     prec: Optional[Tensor] = None
+    grad_norm: List[Tensor] = field(default_factory=list)
 
 
 @dataclass
@@ -171,14 +172,14 @@ class HMCAdaptiveIter(HMCIter):
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
 
     def init(self, cache: Optional[base_sampler.Cache] = None):
-        base_sampler.MHIteration.init(self)
+        HMCIter.init(self)
         self.step_id = 0
 
-        if isinstance(self.common_params.lf_step_size, float):
-            self.common_params.lf_step_size = torch.full(
-                (self.cache.point.shape[0], 1),
-                self.common_params.lf_step_size,
-            )
+        # if isinstance(self.common_params.lf_step_size, float):
+        #     self.common_params.lf_step_size = torch.full(
+        #         (self.cache.point.shape[0], 1),
+        #         self.common_params.lf_step_size,
+        #     )
 
         if self.cache.prec_params is None:
             self.cache.prec_params = CholeskyParametrization(
@@ -188,6 +189,8 @@ class HMCAdaptiveIter(HMCIter):
                 scale=self.fixed_params.prec_init_scale,
                 prec_type=self.fixed_params.prec_type,
             )
+            if hasattr(self.cache, "prec"):
+                self.cache.prec = None
 
         def ensure_tensor(param, shape):
             if isinstance(param, float):
@@ -213,29 +216,43 @@ class HMCAdaptiveIter(HMCIter):
                 total_epochs=self.fixed_params.iter_count,
             )
 
-        build_graph = self.fixed_params.backprop_method == BackpropMethod.FULL
-
         def grad_logp(v: Tensor) -> Tensor:
             return torch.autograd.grad(
                 self.common_params.target_dist.log_prob(v).sum(),
                 v,
-                retain_graph=build_graph,
-                create_graph=build_graph,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+
+        def grad_logp_(v: Tensor) -> Tensor:
+            return torch.autograd.grad(
+                self.common_params.target_dist.log_prob(v).sum(),
+                v,
+                retain_graph=True,
+                create_graph=True,
             )[0]
 
         def DL(x: Tensor, v: Tensor) -> Tensor:
-            z = torch.autograd.functional.jvp(
-                grad_logp,
+            """
+            x: (b, d)
+            v: (b, d) or (b, n, d), in second case x -> (b, n, d)
+            """
+            if v.dim() == 3:
+                x = x.unsqueeze(1).repeat(1, v.shape[1], 1)
+
+            z = torch.autograd.functional.vhp(
+                lambda y: self.common_params.target_dist.log_prob(y).sum(),
                 x,
                 self.matvec_c(v),
-                # torch.bmm(self.cache.prec, v.unsqueeze(-1)).squeeze(-1),
-                create_graph=build_graph,
+                create_graph=True,
             )[1]
-            return (
-                -self.common_params.lf_step_size ** 2 * (self.common_params.lf_step_count ** 2 - 1) / 6
-                * self.matvec_ct(z)
-                # * torch.einsum("...ij,...i->...j", self.cache.prec, z)
-            )
+
+            coef = -self.common_params.lf_step_size ** 2 * (self.common_params.lf_step_count ** 2 - 1) / 6
+
+            if v.dim() == 3:
+                coef = coef.view(-1, 1, 1)
+
+            return coef * self.matvec_ct(z)
 
         self.DL = DL
         self.grad_logp = grad_logp
@@ -254,9 +271,8 @@ class HMCAdaptiveIter(HMCIter):
             self.make_matvecs(self.cache.prec)
             prec = self.cache.prec
         elif self.fixed_params.prec_type == PrecType.TRIDIAG:
-            b, d = self.cache.point.shape
-            prec = self.cache.prec_params.params.view(b, 2 * d - 1)
-            self.make_matvecs(prec, dimension=d)
+            prec = self.cache.prec_params.params
+            self.make_matvecs(prec)
 
         ret = self._run_iter(
             prec=prec,
@@ -324,7 +340,7 @@ class HMCAdaptiveIter(HMCIter):
                 batch_size=mid_traj.shape[0],
                 probe_vector_count=self.common_params.krylov_probe_vectors,
                 lanczos_steps=self.common_params.lanczos_steps,
-                device=self.common_params.device,
+                device=self.fixed_params.device,
             )
 
             entropy = entropy + self.common_params.entropy_weight * ltheta
@@ -430,17 +446,27 @@ class HMCAdaptiveIter(HMCIter):
 
         # torch.autograd.set_detect_anomaly(True)
 
-        loss.backward(retain_graph=False)
+        loss.backward()
 
         for p in self.cache.optimizer.param_groups[0]["params"]:
             if p.grad is None:
                 continue
             torch.nan_to_num_(p.grad, nan=0.0)
 
-        torch.nn.utils.clip_grad_value_(
-            self.cache.optimizer.param_groups[0]["params"],
-            clip_value=self.common_params.clip_grad_value,
-        )
+        with torch.no_grad():
+            torch.nn.utils.clip_grad_value_(
+                self.cache.optimizer.param_groups[0]["params"],
+                self.common_params.clip_grad_value,
+            )
+
+            grads = self.cache.prec_params.params.grad
+            norms = grads.norm(p=2, dim=-1, keepdim=True)
+            # scale = torch.clamp(self.common_params.clip_grad_value / (norms + 1e-6), max=1.)
+            # grads.mul_(scale)
+
+            # grad_norm = (norms * scale).mean()
+            # self.cache.grad_norm.append(grad_norm)
+            self.cache.grad_norm.append(norms.mean())
 
         self.cache.optimizer.step()
         if self.cache.scheduler is not None:
@@ -459,7 +485,7 @@ class HMCAdaptiveIter(HMCIter):
 
 
 @dataclass
-class HMCAdaptive(base_sampler.AlgorithmStoppingRule):
+class HMCAdaptive(HMCVanilla):
     step_size_burn_in_iter_count: int
     burn_in_iter_count: int
     sample_iter_count: int
@@ -471,24 +497,46 @@ class HMCAdaptive(base_sampler.AlgorithmStoppingRule):
     def load_params(self, common_params: base_sampler.CommonParams):
         self.pipeline = base_sampler.Pipeline([
             base_sampler.SampleBlock(
-                iteration=HMCAdaptiveIter(
-                    common_params=common_params,
-                    fixed_params=self.fixed_params,
-                    adapt_step_size_required=True
+                iteration=HMCIter(
+                    common_params=common_params.copy(),
+                    fixed_params=replace(self.fixed_params),
+                    adapt_step_size_required=True,
+                    collect_required=False,
                 ),
-                iteration_count=self.burn_in_iter_count,
-                callback=lambda: print(f"step_size={common_params.lf_step_size.mean()}")
+                iteration_count=self.step_size_burn_in_iter_count,
             ),
             base_sampler.SampleBlock(
                 iteration=HMCAdaptiveIter(
                     common_params=common_params,
                     fixed_params=self.fixed_params,
+                    adapt_step_size_required=False,
+                ),
+                iteration_count=self.burn_in_iter_count,
+            ),
+            # base_sampler.SampleBlock(
+            #     iteration=HMCAdaptiveIter(
+            #         common_params=common_params,
+            #         fixed_params=self.fixed_params,
+            #         adapt_step_size_required=False,
+            #         collect_required=True
+            #     ),
+            #     iteration_count=self.sample_iter_count,
+            #     stopping_rule=self.stopping_rule,
+            #     probe_period=self.probe_period,
+            # ),
+            base_sampler.SampleBlock(
+                iteration=HMCIter(
+                    common_params=common_params,
+                    fixed_params=self.fixed_params,
                     adapt_step_size_required=True,
-                    collect_required=True
+                    collect_required=True,
                 ),
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
-                callback=lambda: print(f"step_size={common_params.lf_step_size.mean()}")
             ),
         ])
+
+        self.pipeline.sample_blocks[0].iteration.fixed_params.prec_type = PrecType.NONE
+        self.adjust_step_exploration()
+        self.add_callbacks()

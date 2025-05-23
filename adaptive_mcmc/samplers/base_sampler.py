@@ -52,6 +52,7 @@ class Cache:
     logp: Optional[Tensor] = None
     grad: Optional[Tensor] = None
     accept_prob_hist: list[float] = field(default_factory=list[float])
+    broken_trajectory_count: int = 0
 
 
 def update_params(params: CommonParams, cache: Cache, new_params: CommonParams) -> None:
@@ -170,6 +171,7 @@ class Pipeline:
     sample_blocks: list[SampleBlock] = field(default_factory=list[SampleBlock])
     runtime: float = 0.
     pure_runtime: float = 0.
+    broken_trajectory_ratio: float = 0.
 
     def append(self, block: SampleBlock):
         self.sample_blocks.append(block)

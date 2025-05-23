@@ -23,8 +23,11 @@ class HMCCommonParams(base_sampler.CommonParams):
     prec: Optional[Tensor] = None
     Minv: Optional[Tensor] = None
     lf_step_size: Union[float, Tensor] = 1e-2
+    lf_step_size_max: Union[float, Tensor] = 1e-2
+    lf_step_size_min: float = 1e-2
     lf_step_size_adaptive_rate: float = 1e-2
-    lf_step_count: int = 5
+    lf_step_size_adaptive_bad_traj_period: int = 5
+    lf_step_count: int = 3
 
 
 @dataclass
@@ -33,6 +36,11 @@ class HMCFixedParams(base_sampler.FixedParams):
     stop_grad: bool = False
     no_grad: bool = True
     prec_type: PrecType = PrecType.NONE
+
+
+@dataclass
+class HMCCache(base_sampler.Cache):
+    pass
 
 
 class Leapfrog():
@@ -45,7 +53,6 @@ class Leapfrog():
         with context:
             p_half = p_prev + 0.5 * step_size * gradq_prev
             q_next = q_prev + step_size * matvec_minv(p_half)
-            # torch.einsum("...ij,...j->...i", Minv, p_half)
 
         q_next = q_next.requires_grad_(True)
 
@@ -102,26 +109,33 @@ class Leapfrog():
 
 @dataclass
 class HMCIter(base_sampler.MHIteration):
+    cache: HMCCache = field(default_factory=HMCCache)
     common_params: HMCCommonParams = field(default_factory=HMCCommonParams)
     fixed_params: HMCFixedParams = field(default_factory=HMCFixedParams)
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
     adapt_step_size_required: bool = False
 
     def init(self, cache=None):
-        super().init(cache=None)
+        super().init(cache=cache)
         self.step_id = 0
 
-        if hasattr(self.cache, "prec") and self.cache.prec is not None:
-            pass
-        elif self.common_params.prec is None:
-            self.cache.prec = torch.eye(
-                self.cache.point.shape[-1],
-                device=self.fixed_params.device
-            ).repeat(*self.cache.point.shape[:-1], 1, 1)
-        else:
-            self.cache.prec = self.common_params.prec
+        if not hasattr(self.cache, 'prec'):
+            self.cache.prec = None
 
-        self.make_matvecs(self.cache.prec)
+        if self.common_params.prec is not None:
+            self.cache.prec = self.common_params.prec
+        else:
+            if (
+                self.fixed_params.prec_type == PrecType.TRIDIAG
+                and hasattr(self.cache, 'prec_params')
+                and self.cache.prec_params is not None
+            ):
+                self.cache.prec = self.cache.prec_params.params
+            else:
+                pass
+
+        if self.cache.prec is not None or self.fixed_params.prec_type == PrecType.NONE:
+            self.make_matvecs(self.cache.prec)
 
         if isinstance(self.common_params.lf_step_size, float):
             self.common_params.lf_step_size = torch.full(
@@ -129,10 +143,17 @@ class HMCIter(base_sampler.MHIteration):
                 self.common_params.lf_step_size,
             )
 
-    def make_matvecs(self, prec: Tensor, dimension=None):
+        if isinstance(self.common_params.lf_step_size_max, float):
+            self.common_params.lf_step_size_max = torch.full(
+                (self.cache.point.shape[0], 1),
+                self.common_params.lf_step_size_max,
+            )
+
+    def make_matvecs(self, prec: Tensor):
         if self.fixed_params.prec_type == PrecType.TRIDIAG:
-            diag = torch.exp(prec[:, :dimension])
-            lower = prec[:, dimension:]
+            d = (prec.shape[1] + 1) // 2
+            diag = torch.exp(prec[:, :d])
+            lower = prec[:, d:]
 
         def matvec_minv(v: Tensor) -> Tensor:
             return matvec_c(matvec_ct(v))
@@ -143,7 +164,12 @@ class HMCIter(base_sampler.MHIteration):
             elif self.fixed_params.prec_type == PrecType.TRIDIAG:
                 return fastmv.tridiag_matmul(v, diag=diag, upper=lower)
             else:
-                return torch.einsum("...ji,...j->...i", prec, v)
+                if v.dim() == 2:
+                    # (b, d) -> (b, d, 1) -> (b, d, 1) -> (b, d)
+                    return torch.bmm(self.prec.transpose(-2, -1), v.unsqueeze(-1)).squeeze(-1)
+                elif v.dim() == 3:
+                    return torch.matmul(v, self.prec)
+                # return torch.einsum("...ji,...j->...i", prec, v)
 
         def matvec_c(v: Tensor) -> Tensor:
             if self.fixed_params.prec_type == PrecType.NONE:
@@ -151,7 +177,12 @@ class HMCIter(base_sampler.MHIteration):
             elif self.fixed_params.prec_type == PrecType.TRIDIAG:
                 return fastmv.tridiag_matmul(v, diag=diag, lower=lower)
             else:
-                return torch.einsum("...ij,...j->...i", prec, v)
+                if v.dim() == 2:
+                    # (b, d) -> (b, d, 1) -> (b, d, 1) -> (b, d)
+                    return torch.bmm(self.prec, v.unsqueeze(-1)).squeeze(-1)
+                elif v.dim() == 3:
+                    return torch.matmul(v, self.prec.transpose(-2, -1))
+                # return torch.einsum("...ij,...j->...i", prec, v)
 
         self.matvec_minv = matvec_minv
         self.matvec_ct = matvec_ct
@@ -168,7 +199,7 @@ class HMCIter(base_sampler.MHIteration):
                 p = fastmv.bidiag_solve_jit(noise, torch.exp(prec[:, :d]), prec[:, d:])
             else:
                 p = torch.linalg.solve_triangular(
-                    torch.einsum("...ij->...ji", prec),
+                    prec.transpose(-2, -1),
                     noise.unsqueeze(-1),
                     upper=True,
                 ).squeeze(-1)
@@ -187,11 +218,22 @@ class HMCIter(base_sampler.MHIteration):
             )
 
             if trajectory is None:
-                # print("bad traj", mask)
+                self.cache.broken_trajectory_count += 1
                 with torch.no_grad():
-                    self.common_params.lf_step_size = self.common_params.lf_step_size * (
-                        1 - self.common_params.lf_step_size_adaptive_rate * (1 if mask is None else mask.unsqueeze(-1))
+                    self.common_params.lf_step_size = torch.clamp(
+                        self.common_params.lf_step_size * (
+                            1 - self.common_params.lf_step_size_adaptive_rate * (1 if mask is None else mask.unsqueeze(-1))
+                        ),
+                        min=self.common_params.lf_step_size_min,
                     )
+
+                    if self.cache.broken_trajectory_count % self.common_params.lf_step_size_adaptive_bad_traj_period == 0:
+                        self.common_params.lf_step_size_max = torch.clamp(
+                            self.common_params.lf_step_size_max * (1 - self.common_params.lf_step_size_adaptive_rate * (
+                                1 if mask is None else mask.unsqueeze(-1)
+                            )),
+                            min=self.common_params.lf_step_size_min,
+                        )
 
         return trajectory[-1]["q"], trajectory
 
@@ -224,10 +266,16 @@ class HMCIter(base_sampler.MHIteration):
 
             if self.adapt_step_size_required:
                 with torch.no_grad():
-                    self.common_params.lf_step_size = self.common_params.lf_step_size * (
-                        1 + self.common_params.lf_step_size_adaptive_rate * (
-                            accept_prob.unsqueeze(-1) - self.fixed_params.target_acceptance
-                        )
+                    self.common_params.lf_step_size = torch.min(
+                        torch.clamp(
+                            self.common_params.lf_step_size * (
+                                1 + self.common_params.lf_step_size_adaptive_rate * (
+                                    accept_prob.unsqueeze(-1) - self.fixed_params.target_acceptance
+                                )
+                            ),
+                            min=self.common_params.lf_step_size_min,
+                        ),
+                        self.common_params.lf_step_size_max,
                     )
 
             self.MHStep(
@@ -271,21 +319,45 @@ class HMCVanilla(base_sampler.AlgorithmStoppingRule):
                 iteration=HMCIter(
                     common_params=common_params,
                     fixed_params=self.fixed_params,
-                    adapt_step_size_required=True
+                    adapt_step_size_required=True,
+                ),
+                iteration_count=self.step_size_burn_in_iter_count,
+            ),
+            base_sampler.SampleBlock(
+                iteration=HMCIter(
+                    common_params=common_params,
+                    fixed_params=self.fixed_params,
+                    adapt_step_size_required=False,
                 ),
                 iteration_count=self.burn_in_iter_count,
-                callback=lambda: print(f"step_size={common_params.lf_step_size.mean()}")
             ),
             base_sampler.SampleBlock(
                 iteration=HMCIter(
                     common_params=common_params,
                     fixed_params=self.fixed_params,
                     adapt_step_size_required=True,
-                    collect_required=True
+                    collect_required=True,
                 ),
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
-                callback=lambda: print(f"step_size={common_params.lf_step_size.mean()}")
             ),
         ])
+
+        self.adjust_step_exploration()
+        self.add_callbacks()
+
+    def adjust_step_exploration(self):
+        self.pipeline.sample_blocks[0].iteration.common_params = self.pipeline.sample_blocks[0].iteration.common_params.copy()
+        self.pipeline.sample_blocks[0].iteration.common_params.lf_step_size_adaptive_rate *= 5
+
+    def add_callbacks(self):
+        def make_callback(block: base_sampler.SampleBlock):
+            def callback():
+                print(f"step_size={block.iteration.common_params.lf_step_size.mean()}")
+                print(f"max_step_size={block.iteration.common_params.lf_step_size_max.mean()}")
+                print(f"broken_traj={block.iteration.cache.broken_trajectory_count}")
+            return callback
+
+        for block in self.pipeline.sample_blocks:
+            block.callback = make_callback(block)
