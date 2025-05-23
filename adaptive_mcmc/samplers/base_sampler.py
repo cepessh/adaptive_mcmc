@@ -38,6 +38,7 @@ class CommonParams(ABC):
 @dataclass
 class FixedParams(ABC):
     device: str = "cpu"
+    dtype: torch.dtype = torch.float32
 
 
 @dataclass

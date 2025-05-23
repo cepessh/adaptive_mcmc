@@ -141,12 +141,14 @@ class HMCIter(base_sampler.MHIteration):
             self.common_params.lf_step_size = torch.full(
                 (self.cache.point.shape[0], 1),
                 self.common_params.lf_step_size,
+                device=self.fixed_params.device,
             )
 
         if isinstance(self.common_params.lf_step_size_max, float):
             self.common_params.lf_step_size_max = torch.full(
                 (self.cache.point.shape[0], 1),
                 self.common_params.lf_step_size_max,
+                device=self.fixed_params.device,
             )
 
     def make_matvecs(self, prec: Tensor):
