@@ -1,5 +1,5 @@
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Callable, Dict, List, Optional, Union
 
@@ -36,6 +36,7 @@ class HMCFixedParams(base_sampler.FixedParams):
     stop_grad: bool = False
     no_grad: bool = True
     prec_type: PrecType = PrecType.NONE
+    adapt_step_size_required: bool = True
 
 
 @dataclass
@@ -113,7 +114,6 @@ class HMCIter(base_sampler.MHIteration):
     common_params: HMCCommonParams = field(default_factory=HMCCommonParams)
     fixed_params: HMCFixedParams = field(default_factory=HMCFixedParams)
     lf_intergrator: Leapfrog = field(default_factory=Leapfrog)
-    adapt_step_size_required: bool = False
 
     def init(self, cache=None):
         super().init(cache=cache)
@@ -266,7 +266,7 @@ class HMCIter(base_sampler.MHIteration):
 
             accept_prob = torch.exp(torch.clamp(-energy_error, max=0))
 
-            if self.adapt_step_size_required:
+            if self.fixed_params.adapt_step_size_required:
                 with torch.no_grad():
                     self.common_params.lf_step_size = torch.min(
                         torch.clamp(
@@ -311,6 +311,7 @@ class HMCVanilla(base_sampler.AlgorithmStoppingRule):
     stopping_rule: Callable
     common_params: HMCCommonParams = field(default_factory=HMCCommonParams)
     fixed_params: HMCFixedParams = field(default_factory=HMCFixedParams)
+    mask_adapt_step_size_required: Optional[List[bool]] = None
 
     def load_params(
         self,
@@ -320,24 +321,21 @@ class HMCVanilla(base_sampler.AlgorithmStoppingRule):
             base_sampler.SampleBlock(
                 iteration=HMCIter(
                     common_params=common_params,
-                    fixed_params=self.fixed_params,
-                    adapt_step_size_required=True,
+                    fixed_params=replace(self.fixed_params),
                 ),
                 iteration_count=self.step_size_burn_in_iter_count,
             ),
             base_sampler.SampleBlock(
                 iteration=HMCIter(
                     common_params=common_params,
-                    fixed_params=self.fixed_params,
-                    adapt_step_size_required=False,
+                    fixed_params=replace(self.fixed_params),
                 ),
                 iteration_count=self.burn_in_iter_count,
             ),
             base_sampler.SampleBlock(
                 iteration=HMCIter(
                     common_params=common_params,
-                    fixed_params=self.fixed_params,
-                    adapt_step_size_required=True,
+                    fixed_params=replace(self.fixed_params),
                     collect_required=True,
                 ),
                 iteration_count=self.sample_iter_count,
@@ -348,6 +346,7 @@ class HMCVanilla(base_sampler.AlgorithmStoppingRule):
 
         self.adjust_step_exploration()
         self.add_callbacks()
+        self.apply_adapt_step_size_mask()
 
     def adjust_step_exploration(self):
         self.pipeline.sample_blocks[0].iteration.common_params = self.pipeline.sample_blocks[0].iteration.common_params.copy()
@@ -363,3 +362,9 @@ class HMCVanilla(base_sampler.AlgorithmStoppingRule):
 
         for block in self.pipeline.sample_blocks:
             block.callback = make_callback(block)
+
+    def apply_adapt_step_size_mask(self):
+        if self.mask_adapt_step_size_required is not None:
+            assert len(self.mask_adapt_step_size_required) == len(self.pipeline.sample_blocks)
+            for flag, block in zip(self.mask_adapt_step_size_required, self.pipeline.sample_blocks):
+                block.iteration.fixed_params.adapt_step_size_required = flag

@@ -500,7 +500,6 @@ class HMCAdaptive(HMCVanilla):
                 iteration=HMCIter(
                     common_params=common_params.copy(),
                     fixed_params=replace(self.fixed_params),
-                    adapt_step_size_required=True,
                     collect_required=False,
                 ),
                 iteration_count=self.step_size_burn_in_iter_count,
@@ -508,8 +507,7 @@ class HMCAdaptive(HMCVanilla):
             base_sampler.SampleBlock(
                 iteration=HMCAdaptiveIter(
                     common_params=common_params,
-                    fixed_params=self.fixed_params,
-                    adapt_step_size_required=False,
+                    fixed_params=replace(self.fixed_params),
                 ),
                 iteration_count=self.burn_in_iter_count,
             ),
@@ -527,8 +525,7 @@ class HMCAdaptive(HMCVanilla):
             base_sampler.SampleBlock(
                 iteration=HMCIter(
                     common_params=common_params,
-                    fixed_params=self.fixed_params,
-                    adapt_step_size_required=True,
+                    fixed_params=replace(self.fixed_params),
                     collect_required=True,
                 ),
                 iteration_count=self.sample_iter_count,
@@ -540,3 +537,4 @@ class HMCAdaptive(HMCVanilla):
         self.pipeline.sample_blocks[0].iteration.fixed_params.prec_type = PrecType.NONE
         self.adjust_step_exploration()
         self.add_callbacks()
+        self.apply_adapt_step_size_mask()
