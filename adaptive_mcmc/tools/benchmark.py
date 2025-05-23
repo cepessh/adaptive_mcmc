@@ -2,7 +2,6 @@ from dataclasses import dataclass
 import time
 from typing import Callable, Union
 
-import jax.numpy as jnp
 import matplotlib.pyplot as plt
 from torch import Tensor
 import torch
@@ -63,8 +62,11 @@ class BenchmarkUtils:
     @staticmethod
     def compute_metrics(mcmc_samples: Tensor, true_samples: Tensor,
                         **kwargs) -> dict:
-        return metrics.compute_metrics(jnp.array(true_samples),
-                                       jnp.array(mcmc_samples), **kwargs)
+        return metrics.compute_metrics(
+            xs_true=true_samples,
+            xs_pred=mcmc_samples,
+            **kwargs
+        )
 
 
 @dataclass
