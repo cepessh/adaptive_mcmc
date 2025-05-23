@@ -137,94 +137,16 @@ class FunnelDistribution(SamplableDistribution):
         Computes the log probability of data under the Funnel distribution.
 
         Args:
-            z (Tensor): Input data of shape (N, dimension).
+            z (Tensor): Input data of shape (..., dimension).
 
         Returns:
             Tensor: Log probabilities of the input data.
         """
-        first_dim = z[:, 0]
-        rest_dims = z[:, 1:]
+        first_dim = z[..., 0]
+        rest_dims = z[..., 1:]
 
         ret = torch.square(rest_dims).sum(dim=-1) / (2 * torch.exp(first_dim))
         ret += 0.5 * (self.dimension - 1) * first_dim
         ret += 0.5 * torch.square(first_dim) / (2 * self.scale)
 
         return -ret
-
-
-# class ManyWellDistribution(SamplableDistribution):
-#     """
-#     A “many-well” multimodal distribution in R^d, defined as a uniform mixture
-#     of isotropic Gaussians (the “wells”) whose centers are scattered in space.
-#     """
-#     def __init__(self,
-#                  dimension: int,
-#                  num_wells: int = 10,
-#                  sigma: float = 0.3,
-#                  domain: float = 4.0,
-#                  device: str = 'cpu',
-#                  dtype=torch.float32):
-#         """
-#         Args:
-#             dimension (int): Dimensionality of the ambient space.
-#             num_wells (int): Number of Gaussian wells (modes).
-#             sigma (float): Standard deviation of each well.
-#             domain (float): Half‐width of the cube in which well centers lie,
-#                             i.e. centers ~ Uniform([-domain,domain]^d).
-#             device (str): Torch device for storage.
-#             dtype: Torch dtype.
-#         """
-#         self.dimension = dimension
-#         self.num_wells = num_wells
-#         self.sigma = sigma
-#         self.device = device
-#         self.dtype = dtype
-# 
-#         self.log_weight = -torch.log(torch.tensor(float(num_wells),
-#                                                   device=device, dtype=dtype))
-# 
-#         self.means = (
-#             torch.rand(num_wells, dimension, device=device, dtype=dtype) * 2 * domain
-#             - domain
-#         )
-# 
-#         self.log_norm_const = -0.5 * dimension * torch.log(2 * torch.pi * sigma**2)
-# 
-#         self.cat = Categorical(logits=torch.full((num_wells,),
-#                                                  self.log_weight,
-#                                                  device=device,
-#                                                  dtype=dtype))
-# 
-#     def sample(self, sample_count: int) -> Tensor:
-#         """
-#         Draw samples from the many‐well mixture by first selecting a well
-#         uniformly, then sampling from N(mean, σ² I).
-# 
-#         Returns:
-#             Tensor shape (sample_count, dimension)
-#         """
-#         idx = self.cat.sample((sample_count,))
-#         chosen_means = self.means[idx]
-#         eps = torch.randn(sample_count, self.dimension,
-#                           device=self.device,
-#                           dtype=self.dtype) * self.sigma
-#         return chosen_means + eps
-# 
-#     def log_prob(self, z: Tensor) -> Tensor:
-#         """
-#         Compute log p(z) = log [ (1/K) * Σ_i N(z | μ_i, σ² I) ] via log-sum-exp.
-# 
-#         Args:
-#             z: Tensor of shape (N, dimension)
-#         Returns:
-#             Tensor of shape (N,) giving log-probabilities
-#         """
-#         # z: (N, d) → expand to (N, num_wells, d)
-#         z_expanded = z.unsqueeze(1)                      # (N, 1, d)
-#         # compute squared distances to each well center: (N, num_wells)
-#         diff2 = torch.sum((z_expanded - self.means.unsqueeze(0))**2,
-#                           dim=-1)                        # (N, num_wells)
-#         # Gaussian log densities (N_i): (N, num_wells)
-#         log_gauss = self.log_norm_const - 0.5 * diff2 / (self.sigma**2)
-#         # add log mixture weight, then log-sum-exp
-#         return torch.logsumexp(log_gauss + self.log_weight, dim=1)

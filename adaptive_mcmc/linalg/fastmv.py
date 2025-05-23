@@ -11,23 +11,29 @@ def tridiag_matmul(
 ) -> torch.Tensor:
     """
     Multiply a batch of tridiagonal matrices by x, without forming the full matrix.
-    lower: (..., n‑1)  – sub‑diagonal entries
-    diag:  (..., n)    – main‑diagonal entries
-    upper: (..., n‑1)  – super‑diagonal entries
-    x:     (..., n)    – vector(s) to multiply
-    returns y = T @ x with shape (..., n)
+    lower: (b, d‑1)  – sub‑diagonal entries
+    diag:  (b, d)    – main‑diagonal entries
+    upper: (b, d‑1)  – super‑diagonal entries
+    x:     (b, d) or (b, n, d)   – vector(s) to multiply
+    returns y = T @ x with shape (b, d) or (b, n, d)
     """
     y = torch.zeros_like(x)
     if diag is not None:
+        if x.dim() == 3:
+            diag = diag.unsqueeze(1)
         y = y + diag * x
 
     if upper is not None:
-        up_contrib = upper * x[..., 1:]               # (..., n-1)
-        y = y + F.pad(up_contrib, (0, 1))             # (..., n)
+        if x.dim() == 3:
+            upper = upper.unsqueeze(1)
+        up_contrib = upper * x[..., 1:]               # (..., d-1)
+        y = y + F.pad(up_contrib, (0, 1))             # (..., d)
 
     if lower is not None:
-        lo_contrib = lower * x[..., :-1]              # (..., n-1)
-        y = y + F.pad(lo_contrib, (1, 0))             # (..., n)
+        if x.dim() == 3:
+            lower = lower.unsqueeze(1)
+        lo_contrib = lower * x[..., :-1]              # (..., d-1)
+        y = y + F.pad(lo_contrib, (1, 0))             # (..., d)
 
     return y
 
