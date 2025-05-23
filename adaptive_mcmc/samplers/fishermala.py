@@ -8,7 +8,8 @@ from torch.distributions import Distribution as torchDist
 
 from adaptive_mcmc.distributions.distribution import Distribution
 from adaptive_mcmc.samplers import base_sampler
-from adaptive_mcmc.samplers.mala import MALAIter, MALAParams
+from adaptive_mcmc.samplers.mala import MALAIter
+# , MALACommonParams
 
 
 def h(z: Tensor, v: Tensor, sigma: Tensor, prec_factors: list[Tensor],
@@ -19,28 +20,35 @@ def h(z: Tensor, v: Tensor, sigma: Tensor, prec_factors: list[Tensor],
     prec_factors List[(sample_count, n_dim, n_dim)]
     """
 
+    v = v.requires_grad_(True)
     logp_v = target_dist.log_prob(v)
     grad_v = torch.autograd.grad(logp_v.sum(), v)[0].detach()
+    v = v.requires_grad_(False)
 
-    grad_v_img = torch.einsum("...ij,...j->...i", prec_factors[-1], grad_v)
-    for factor in reversed(prec_factors[:-1]):
-        grad_v_img = torch.einsum("...ij,...j->...i", factor, grad_v_img)
+    with torch.no_grad():
+        grad_v_img = torch.einsum("...ij,...j->...i", prec_factors[-1], grad_v)
+        for factor in reversed(prec_factors[:-1]):
+            grad_v_img = torch.einsum("...ij,...j->...i", factor, grad_v_img)
 
-    return 0.5 * torch.einsum(
-        "...i,...i->...",
-        grad_v,
-        z - v - 0.25 * torch.einsum("...i,...->...i", grad_v_img, sigma ** 2)
-    )
+        return 0.5 * torch.einsum(
+            "...i,...i->...",
+            grad_v,
+            z - v - 0.25 * torch.einsum("...i,...->...i", grad_v_img, sigma ** 2)
+        )
 
 
 @dataclass
-class FisherMALAParams(base_sampler.Params):
-    prec: Optional[Tensor] = None
-    sigma: Union[Tensor, float] = 1.
+class FisherMALACommonParams(base_sampler.CommonParams):
+    sigma: Union[Tensor, float] = 1e0
     sigma_prec: Optional[Tensor] = None
-    target_acceptance: float = 0.574
-    sigma_lr: float = 0.015
+    sigma_lr: float = 1.5e-2
     dampening: float = 10.
+
+
+@dataclass
+class FisherMALAFixedParams(base_sampler.FixedParams):
+    target_acceptance: float = 0.574
+    adapt_prec_required: bool = True
 
 
 @dataclass
@@ -50,87 +58,98 @@ class AdaptiveCache(base_sampler.Cache):
 
 @dataclass
 class FisherMALAIter(base_sampler.MHIteration):
-    params: FisherMALAParams = field(default_factory=FisherMALAParams)
+    common_params: FisherMALACommonParams = field(default_factory=FisherMALACommonParams)
+    fixed_params: FisherMALAFixedParams = field(default_factory=FisherMALAFixedParams)
     cache: AdaptiveCache = field(default_factory=AdaptiveCache)
 
     def init(self, cache=None):
         super().init(cache)
         self.step_id = 0
 
-        # TODO: move adaptive parameters like prec from params to cache
-        if self.params.prec is None:
-            self.params.prec = torch.eye(self.cache.point.shape[-1]).repeat(*self.cache.point.shape[:-1], 1, 1)
+        if self.cache.prec is None:
+            self.cache.prec = torch.eye(
+                self.cache.point.shape[-1],
+                dtype=self.fixed_params.dtype,
+                device=self.fixed_params.device,
+            ).repeat(*self.cache.point.shape[:-1], 1, 1)
 
-        if isinstance(self.params.sigma, float):
-            self.params.sigma_prec = Tensor([self.params.sigma]).repeat(*self.cache.point.shape[:-1], 1, 1)
-            self.params.sigma = Tensor([self.params.sigma]).repeat(*self.cache.point.shape[:-1], 1)
+        if isinstance(self.common_params.sigma, float):
+            self.common_params.sigma_prec = Tensor([self.common_params.sigma]).repeat(*self.cache.point.shape[:-1], 1, 1)
+            self.common_params.sigma = Tensor([self.common_params.sigma]).repeat(*self.cache.point.shape[:-1], 1)
         else:
-            self.params.sigma = self.params.sigma.reshape(*self.cache.point.shape[:-1], 1)
-            self.params.sigma_prec = self.params.sigma.clone()
+            self.common_params.sigma = self.common_params.sigma.reshape(*self.cache.point.shape[:-1], 1)
+            self.common_params.sigma_prec = self.common_params.sigma.clone()
 
     def _adapt(self, accept_prob: Tensor, grad_new: Tensor, ):
         with torch.no_grad():
             signal_adaptation = torch.sqrt(accept_prob).unsqueeze(-1) * (grad_new - self.cache.grad)
 
-            phi_n = torch.einsum("...ji,...j->...i", self.params.prec, signal_adaptation)
+            phi_n = torch.einsum("...ji,...j->...i", self.cache.prec, signal_adaptation)
             gramm_diag = torch.square(phi_n).sum(dim=-1, keepdim=True).unsqueeze(-1)
 
             if self.step_id == 0:
-                r_1 = 1. / (1 + torch.sqrt(self.params.dampening / (self.params.dampening + gramm_diag)))
+                r_1 = 1. / (1 + torch.sqrt(self.common_params.dampening / (self.common_params.dampening + gramm_diag)))
                 shift = torch.einsum("...i,...j->...ij", phi_n, phi_n)
-                self.params.prec = 1. / self.params.dampening ** 0.5 * (
-                    self.params.prec - shift * r_1 / (self.params.dampening + gramm_diag)
+                self.cache.prec = 1. / self.common_params.dampening ** 0.5 * (
+                    self.cache.prec - shift * r_1 / (self.common_params.dampening + gramm_diag)
                 )
+                print(self.cache.prec.abs().max())
             else:
                 r_n = 1. / (1 + torch.sqrt(1 / (1 + gramm_diag)))
                 shift = torch.einsum(
                     "...i,...j->...ij",
-                    torch.einsum("...ij,...j->...i", self.params.prec, phi_n),
+                    torch.einsum("...ij,...j->...i", self.cache.prec, phi_n),
                     phi_n,
                 )
-                self.params.prec = self.params.prec - shift * r_n / (1 + gramm_diag)
+                self.cache.prec = self.cache.prec - shift * r_n / (1 + gramm_diag)
+                print(self.cache.prec.abs().max())
 
-            self.params.sigma = self.params.sigma * (
-                1 + self.params.sigma_lr * (accept_prob.unsqueeze(-1) - self.params.target_acceptance)
-            ) ** 0.5
+            self.common_params.sigma = self.common_params.sigma * (
+                1 + self.common_params.sigma_lr * (
+                    accept_prob.unsqueeze(-1) - self.fixed_params.target_acceptance
+                )
+            )
 
-            trace_prec = torch.square(self.params.prec).sum(dim=[-2, -1]).unsqueeze(-1)
+            trace_prec = torch.square(self.cache.prec).sum(dim=[-2, -1]).unsqueeze(-1)
             normalizer = (1. / self.cache.point.shape[-1]) * trace_prec
-            self.params.sigma_prec = self.params.sigma / normalizer ** 0.5
+            self.common_params.sigma_prec = self.common_params.sigma / normalizer ** 0.5
 
-        self.cache.point = self.cache.point.detach().requires_grad_()
+        # self.cache.point = self.cache.point.detach().requires_grad_()
 
     def run(self):
-        h_ = partial(h, prec_factors=[self.params.prec, self.params.prec.permute(0, 2, 1)],
-                     target_dist=self.params.target_dist, sigma=self.params.sigma_prec.squeeze(-1))
+        h_ = partial(h, prec_factors=[self.cache.prec, self.cache.prec.permute(0, 2, 1)],
+                     target_dist=self.common_params.target_dist, sigma=self.common_params.sigma_prec.squeeze(-1))
 
-        noise = self.params.proposal_dist.sample(self.cache.point.shape[:-1])
+        with torch.no_grad():
+            noise = self.common_params.proposal_dist.sample(self.cache.point.shape[:-1])
 
-        grad_x_img = torch.einsum(
-            "...ij,...j->...i",
-            self.params.prec,
-            torch.einsum("...ji,...j->...i", self.params.prec, self.cache.grad)
-        )
+            grad_x_img = torch.einsum(
+                "...ij,...j->...i",
+                self.cache.prec,
+                torch.einsum("...ji,...j->...i", self.cache.prec, self.cache.grad)
+            )
 
-        point_new = (
-            self.cache.point + (
-                0.5 * grad_x_img * self.params.sigma_prec ** 2
-                + torch.einsum("...ij,...j->...i", self.params.prec, noise) * self.params.sigma_prec
-            ).squeeze()
-        )
+            point_new = (
+                self.cache.point + (
+                    0.5 * grad_x_img * self.common_params.sigma_prec ** 2
+                    + torch.einsum("...ij,...j->...i", self.cache.prec, noise) * self.common_params.sigma_prec
+                ).squeeze()
+            )
 
         point_new = point_new.detach().requires_grad_()
-
-        logp_new = self.params.target_dist.log_prob(point_new)
+        logp_new = self.common_params.target_dist.log_prob(point_new)
         grad_new = torch.autograd.grad(logp_new.sum(), point_new)[0].detach()
+        point_new = point_new.requires_grad_(False)
 
-        accept_prob = torch.clamp(
-            torch.exp(
-                logp_new + h_(self.cache.point, point_new)
-                - self.cache.logp - h_(point_new, self.cache.point)
-            ),
-            max=1.
-        ).detach()
+        h_val = h_(self.cache.point, point_new) - h_(point_new, self.cache.point)
+
+        with torch.no_grad():
+            accept_prob = torch.clamp(
+                torch.exp(
+                    logp_new + h_val - self.cache.logp
+                ),
+                max=1.
+            )
 
         self.MHStep(
             point_new=point_new,
@@ -139,38 +158,56 @@ class FisherMALAIter(base_sampler.MHIteration):
             accept_prob=accept_prob,
         )
 
-        if self.params.collect_sample:
+        if self.collect_required:
             self.collect_sample(self.cache.point.detach().clone())
 
         self.step_id += 1
 
-        self._adapt(accept_prob=accept_prob, grad_new=grad_new)
+        if self.fixed_params.adapt_prec_required:
+            self._adapt(accept_prob=accept_prob, grad_new=grad_new)
 
 
 @dataclass
 class FisherMALAVanilla(base_sampler.AlgorithmStoppingRule):
-    sigma_burn_in_params: MALAParams
     sigma_burn_in_iter_count: int
-    prec_burn_in_params: FisherMALAParams
     prec_burn_in_iter_count: int
     sample_iter_count: int
     probe_period: int
     stopping_rule: Callable
+    common_params: Optional[FisherMALACommonParams] = None
+    fixed_params: FisherMALAFixedParams = field(default_factory=FisherMALAFixedParams)
 
-    def load_params(self, params: base_sampler.Params):
+    def load_params(self, common_params: base_sampler.CommonParams):
         self.pipeline = base_sampler.Pipeline([
             base_sampler.SampleBlock(
-                iteration=MALAIter(params=params.copy_update(self.sigma_burn_in_params)),
+                iteration=MALAIter(
+                    common_params=common_params,
+                ),
                 iteration_count=self.sigma_burn_in_iter_count,
             ),
             base_sampler.SampleBlock(
-                iteration=FisherMALAIter(params=params.copy_update(self.prec_burn_in_params)),
+                iteration=FisherMALAIter(
+                    common_params=common_params,
+                ),
                 iteration_count=self.prec_burn_in_iter_count,
             ),
             base_sampler.SampleBlock(
-                iteration=FisherMALAIter(params=params.copy_update(self.prec_burn_in_params)),
+                iteration=FisherMALAIter(
+                    common_params=common_params,
+                    collect_required=True,
+                ),
                 iteration_count=self.sample_iter_count,
                 stopping_rule=self.stopping_rule,
                 probe_period=self.probe_period,
             ),
         ])
+
+        self.pipeline.sample_blocks[-1].iteration.fixed_params.adapt_prec_required = False
+
+        def make_callback(block: base_sampler.SampleBlock):
+            def callback():
+                print(f"step_size={block.iteration.common_params.sigma.mean()}")
+            return callback
+
+        for block in self.pipeline.sample_blocks:
+            block.callback = make_callback(block)
