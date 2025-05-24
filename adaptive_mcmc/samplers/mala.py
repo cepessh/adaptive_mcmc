@@ -38,22 +38,37 @@ class MALAIter(base_sampler.MHIteration):
 
         noise = params.proposal_dist.sample(self.cache.point.shape[:-1])
 
-        proposal_point = (
-            self.cache.point
-            + 0.5 * self.cache.grad * params.sigma ** 2
-            + noise * params.sigma
-        ).detach().requires_grad_()
+        while True:
+            proposal_point = (
+                self.cache.point
+                + 0.5 * self.cache.grad * params.sigma ** 2
+                + noise * params.sigma
+            ).detach().requires_grad_()
 
-        logp_y = params.target_dist.log_prob(proposal_point)
-        grad_y = torch.autograd.grad(logp_y.sum(), proposal_point)[0].detach()
+            logp_y = params.target_dist.log_prob(proposal_point)
+            grad_y = torch.autograd.grad(logp_y.sum(), proposal_point)[0].detach()
+
+            mask = (~torch.isfinite(logp_y))
+            mask |= (~torch.isfinite(grad_y)).any(dim=-1)
+
+            if mask.any():
+                params.sigma = params.sigma * (1 - params.sigma_lr * mask.unsqueeze(-1))
+            else:
+                break
 
         with torch.no_grad():
-            log_qyx = params.proposal_dist.log_prob(noise)
-            log_qxy = params.proposal_dist.log_prob(
-                (self.cache.point - proposal_point
-                 - 0.5 * params.sigma ** 2 * grad_y) / params.sigma
-            )
-            accept_prob = torch.clamp((logp_y + log_qxy - self.cache.logp - log_qyx).exp(), max=1.).detach()
+            while True:
+                try:
+                    log_qyx = params.proposal_dist.log_prob(noise)
+                    log_qxy = params.proposal_dist.log_prob(
+                        (self.cache.point - proposal_point
+                         - 0.5 * params.sigma ** 2 * grad_y) / params.sigma
+                    )
+                    accept_prob = torch.clamp((logp_y + log_qxy - self.cache.logp - log_qyx).exp(), max=1.).detach()
+                    break
+
+                except ValueError:
+                    params.sigma = params.sigma * (1 - params.sigma_lr * mask)
 
             params.sigma = params.sigma * (
                 1 + params.sigma_lr * (
